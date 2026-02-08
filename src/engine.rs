@@ -1,9 +1,10 @@
 use std::collections::HashSet;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use ulid::Ulid;
 
 use crate::model::*;
@@ -12,9 +13,108 @@ use crate::wal::Wal;
 
 pub type SharedResourceState = Arc<RwLock<ResourceState>>;
 
+// ── Group-commit WAL channel ─────────────────────────────
+
+enum WalCommand {
+    Append {
+        event: Event,
+        response: oneshot::Sender<io::Result<()>>,
+    },
+    Compact {
+        events: Vec<Event>,
+        response: oneshot::Sender<io::Result<()>>,
+    },
+    AppendsSinceCompact {
+        response: oneshot::Sender<u64>,
+    },
+}
+
+/// Background task that owns the WAL and batches appends for group commit.
+/// 1. Block until the first Append arrives.
+/// 2. Buffer it (no fsync).
+/// 3. Drain all immediately available Appends (the batch window).
+/// 4. Single flush_sync for the whole batch.
+/// 5. Respond Ok to all senders.
+async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            WalCommand::Append { event, response } => {
+                let mut batch = vec![(event, response)];
+
+                // Drain all immediately available appends
+                loop {
+                    match rx.try_recv() {
+                        Ok(WalCommand::Append { event, response }) => {
+                            batch.push((event, response));
+                        }
+                        Ok(other) => {
+                            // Flush current batch first, then handle the non-append command
+                            let result = flush_batch(&mut wal, &mut batch);
+                            respond_batch(&mut batch, &result);
+                            handle_non_append(&mut wal, other);
+                            break;
+                        }
+                        Err(_) => break, // channel empty — flush batch
+                    }
+                }
+
+                if !batch.is_empty() {
+                    let result = flush_batch(&mut wal, &mut batch);
+                    respond_batch(&mut batch, &result);
+                }
+            }
+            other => handle_non_append(&mut wal, other),
+        }
+    }
+}
+
+fn flush_batch(wal: &mut Wal, batch: &mut [(Event, oneshot::Sender<io::Result<()>>)]) -> io::Result<()> {
+    let mut append_err: Option<io::Error> = None;
+    for (event, _) in batch.iter() {
+        if let Err(e) = wal.append_buffered(event) {
+            append_err = Some(e);
+            break;
+        }
+    }
+    // Always flush — even on append error — so partially buffered bytes
+    // don't leak into the next batch (callers were told this batch failed).
+    let flush_err = wal.flush_sync().err();
+    if let Some(e) = append_err {
+        return Err(e);
+    }
+    if let Some(e) = flush_err {
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn respond_batch(batch: &mut Vec<(Event, oneshot::Sender<io::Result<()>>)>, result: &io::Result<()>) {
+    for (_, tx) in batch.drain(..) {
+        let r = match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+        };
+        let _ = tx.send(r);
+    }
+}
+
+fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
+    match cmd {
+        WalCommand::Compact { events, response } => {
+            let result = Wal::write_compact_file(wal.path(), &events)
+                .and_then(|()| wal.swap_compact_file());
+            let _ = response.send(result);
+        }
+        WalCommand::AppendsSinceCompact { response } => {
+            let _ = response.send(wal.appends_since_compact());
+        }
+        WalCommand::Append { .. } => unreachable!(),
+    }
+}
+
 pub struct Engine {
     pub state: DashMap<Ulid, SharedResourceState>,
-    wal: tokio::sync::Mutex<Wal>,
+    wal_tx: mpsc::Sender<WalCommand>,
     pub notify: Arc<NotifyHub>,
     /// Reverse lookup: entity (rule/allocation) id → resource id
     entity_to_resource: DashMap<Ulid, Ulid>,
@@ -31,6 +131,25 @@ fn apply_to_resource(rs: &mut ResourceState, event: &Event, entity_map: &DashMap
             span,
             blocking,
         } => {
+            let kind = if *blocking {
+                IntervalKind::Blocking
+            } else {
+                IntervalKind::NonBlocking
+            };
+            rs.insert_interval(Interval {
+                id: *id,
+                span: *span,
+                kind,
+            });
+            entity_map.insert(*id, *resource_id);
+        }
+        Event::RuleUpdated {
+            id,
+            resource_id,
+            span,
+            blocking,
+        } => {
+            rs.remove_interval(*id);
             let kind = if *blocking {
                 IntervalKind::Blocking
             } else {
@@ -70,17 +189,23 @@ fn apply_to_resource(rs: &mut ResourceState, event: &Event, entity_map: &DashMap
             id,
             resource_id,
             span,
+            label,
         } => {
             rs.insert_interval(Interval {
                 id: *id,
                 span: *span,
-                kind: IntervalKind::Booking,
+                kind: IntervalKind::Booking { label: label.clone() },
             });
             entity_map.insert(*id, *resource_id);
         }
         Event::BookingCancelled { id, .. } => {
             rs.remove_interval(*id);
             entity_map.remove(id);
+        }
+        Event::ResourceUpdated { name, capacity, buffer_after, .. } => {
+            rs.name = name.clone();
+            rs.capacity = *capacity;
+            rs.buffer_after = *buffer_after;
         }
         // ResourceCreated/Deleted are handled at the DashMap level, not here
         Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } => {}
@@ -90,9 +215,13 @@ fn apply_to_resource(rs: &mut ResourceState, event: &Event, entity_map: &DashMap
 impl Engine {
     pub fn new(wal_path: PathBuf, notify: Arc<NotifyHub>) -> std::io::Result<Self> {
         let events = Wal::replay(&wal_path)?;
+        let wal = Wal::open(&wal_path)?;
+        let (wal_tx, wal_rx) = mpsc::channel(4096);
+        tokio::spawn(wal_writer_loop(wal, wal_rx));
+
         let engine = Self {
             state: DashMap::new(),
-            wal: tokio::sync::Mutex::new(Wal::open(&wal_path)?),
+            wal_tx,
             notify,
             entity_to_resource: DashMap::new(),
             children: DashMap::new(),
@@ -103,8 +232,8 @@ impl Engine {
         // here because this may run inside an async context (e.g. lazy tenant creation).
         for event in &events {
             match event {
-                Event::ResourceCreated { id, parent_id, capacity, buffer_after } => {
-                    let rs = ResourceState::new(*id, *parent_id, *capacity, *buffer_after);
+                Event::ResourceCreated { id, parent_id, name, capacity, buffer_after } => {
+                    let rs = ResourceState::new(*id, *parent_id, name.clone(), *capacity, *buffer_after);
                     engine.state.insert(*id, Arc::new(RwLock::new(rs)));
                     if let Some(pid) = parent_id {
                         engine.children.entry(*pid).or_default().push(*id);
@@ -137,10 +266,18 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Write event to WAL.
+    /// Write event to WAL via the background group-commit writer.
     async fn wal_append(&self, event: &Event) -> Result<(), EngineError> {
-        let mut wal = self.wal.lock().await;
-        wal.append(event)
+        let (tx, rx) = oneshot::channel();
+        self.wal_tx
+            .send(WalCommand::Append {
+                event: event.clone(),
+                response: tx,
+            })
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer shut down".into()))?;
+        rx.await
+            .map_err(|_| EngineError::WalError("WAL writer dropped response".into()))?
             .map_err(|e| EngineError::WalError(e.to_string()))
     }
 
@@ -218,6 +355,7 @@ impl Engine {
         &self,
         id: Ulid,
         parent_id: Option<Ulid>,
+        name: Option<String>,
         capacity: u32,
         buffer_after: Option<Ms>,
     ) -> Result<(), EngineError> {
@@ -233,9 +371,9 @@ impl Engine {
             }
         }
 
-        let event = Event::ResourceCreated { id, parent_id, capacity, buffer_after };
+        let event = Event::ResourceCreated { id, parent_id, name: name.clone(), capacity, buffer_after };
         self.wal_append(&event).await?;
-        let rs = ResourceState::new(id, parent_id, capacity, buffer_after);
+        let rs = ResourceState::new(id, parent_id, name, capacity, buffer_after);
         self.state.insert(id, Arc::new(RwLock::new(rs)));
         if let Some(pid) = parent_id {
             self.children.entry(pid).or_default().push(id);
@@ -377,6 +515,7 @@ impl Engine {
         id: Ulid,
         resource_id: Ulid,
         span: Span,
+        label: Option<String>,
     ) -> Result<(), EngineError> {
         let rs = self
             .get_resource(&resource_id)
@@ -390,6 +529,7 @@ impl Engine {
             id,
             resource_id,
             span,
+            label,
         };
         self.wal_append(&event).await?;
         apply_to_resource(&mut guard, &event, &self.entity_to_resource);
@@ -401,7 +541,7 @@ impl Engine {
     /// none are committed. Bookings may span different resources.
     pub async fn batch_confirm_bookings(
         &self,
-        bookings: Vec<(Ulid, Ulid, Span)>, // (id, resource_id, span)
+        bookings: Vec<(Ulid, Ulid, Span, Option<String>)>, // (id, resource_id, span, label)
     ) -> Result<(), EngineError> {
         if bookings.is_empty() {
             return Ok(());
@@ -409,7 +549,7 @@ impl Engine {
 
         // Collect unique resource IDs and acquire write locks in sorted order
         // to prevent deadlocks.
-        let mut resource_ids: Vec<Ulid> = bookings.iter().map(|(_, rid, _)| *rid).collect();
+        let mut resource_ids: Vec<Ulid> = bookings.iter().map(|(_, rid, _, _)| *rid).collect();
         resource_ids.sort();
         resource_ids.dedup();
 
@@ -432,7 +572,7 @@ impl Engine {
         // Group bookings by resource to validate intra-batch conflicts.
         let mut by_resource: std::collections::HashMap<Ulid, Vec<(Ulid, Span)>> =
             std::collections::HashMap::new();
-        for (id, rid, span) in &bookings {
+        for (id, rid, span, _) in &bookings {
             by_resource.entry(*rid).or_default().push((*id, *span));
         }
 
@@ -467,16 +607,17 @@ impl Engine {
         }
 
         // Phase 2: All validated — commit all bookings.
-        for (id, resource_id, span) in &bookings {
+        for (id, resource_id, span, label) in bookings {
             let event = Event::BookingConfirmed {
-                id: *id,
-                resource_id: *resource_id,
-                span: *span,
+                id,
+                resource_id,
+                span,
+                label,
             };
             self.wal_append(&event).await?;
-            let guard_idx = rs_map[resource_id];
+            let guard_idx = rs_map[&resource_id];
             apply_to_resource(&mut guards[guard_idx], &event, &self.entity_to_resource);
-            self.notify.send(*resource_id, &event);
+            self.notify.send(resource_id, &event);
         }
 
         Ok(())
@@ -505,9 +646,10 @@ impl Engine {
         query_end: Ms,
         min_duration_ms: Option<Ms>,
     ) -> Result<Vec<Span>, EngineError> {
-        let rs = self
-            .get_resource(&resource_id)
-            .ok_or(EngineError::NotFound(resource_id))?;
+        let rs = match self.get_resource(&resource_id) {
+            Some(rs) => rs,
+            None => return Ok(vec![]),
+        };
         let guard = rs.read().await;
 
         let query = Span::new(query_start, query_end);
@@ -530,6 +672,203 @@ impl Engine {
         Ok(free)
     }
 
+    /// Compute combined availability across multiple independent resources.
+    ///
+    /// Uses a sweep-line over each resource's individual availability to find
+    /// time spans where at least `min_available` resources are simultaneously free.
+    ///
+    /// - `min_available = resource_ids.len()` → intersection (ALL must be free)
+    /// - `min_available = 1` → union (ANY one free)
+    /// - `min_available = N` → at least N free (pool scheduling)
+    pub async fn compute_multi_availability(
+        &self,
+        resource_ids: &[Ulid],
+        query_start: Ms,
+        query_end: Ms,
+        min_available: usize,
+        min_duration_ms: Option<Ms>,
+    ) -> Result<Vec<Span>, EngineError> {
+        if resource_ids.is_empty() || min_available == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Get each resource's availability independently
+        let mut all_events: Vec<(Ms, i32)> = Vec::new();
+        for &rid in resource_ids {
+            let spans = self
+                .compute_availability(rid, query_start, query_end, None)
+                .await?;
+            for s in spans {
+                all_events.push((s.start, 1));  // +1: resource becomes available
+                all_events.push((s.end, -1));   // -1: resource becomes unavailable
+            }
+        }
+
+        // Sweep-line: find spans where count >= min_available
+        // Sort by time, then ends (-1) before starts (+1) at same timestamp
+        // so adjacent spans don't get false overlap
+        all_events.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut result = Vec::new();
+        let mut count: i32 = 0;
+        let mut seg_start: Option<Ms> = None;
+        let threshold = min_available as i32;
+
+        for (time, delta) in &all_events {
+            let prev = count;
+            count += delta;
+
+            if prev < threshold && count >= threshold {
+                seg_start = Some(*time);
+            } else if prev >= threshold && count < threshold {
+                if let Some(start) = seg_start.take() {
+                    if *time > start {
+                        let span = Span::new(start, *time);
+                        if min_duration_ms.map_or(true, |d| span.duration_ms() >= d) {
+                            result.push(span);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    // ── Queries ──────────────────────────────────────────────────
+
+    pub fn list_resources(&self) -> Vec<ResourceInfo> {
+        self.state
+            .iter()
+            .map(|entry| {
+                let rs = entry.value().clone();
+                let guard = rs.try_read().expect("list_resources: uncontended read");
+                ResourceInfo {
+                    id: guard.id,
+                    parent_id: guard.parent_id,
+                    name: guard.name.clone(),
+                    capacity: guard.capacity,
+                    buffer_after: guard.buffer_after,
+                }
+            })
+            .collect()
+    }
+
+    pub async fn get_rules(&self, resource_id: Ulid) -> Result<Vec<RuleInfo>, EngineError> {
+        let rs = match self.get_resource(&resource_id) {
+            Some(rs) => rs,
+            None => return Ok(vec![]),
+        };
+        let guard = rs.read().await;
+        Ok(guard
+            .intervals
+            .iter()
+            .filter_map(|i| match &i.kind {
+                IntervalKind::NonBlocking => Some(RuleInfo {
+                    id: i.id,
+                    resource_id,
+                    start: i.span.start,
+                    end: i.span.end,
+                    blocking: false,
+                }),
+                IntervalKind::Blocking => Some(RuleInfo {
+                    id: i.id,
+                    resource_id,
+                    start: i.span.start,
+                    end: i.span.end,
+                    blocking: true,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    pub async fn get_bookings(&self, resource_id: Ulid) -> Result<Vec<BookingInfo>, EngineError> {
+        let rs = match self.get_resource(&resource_id) {
+            Some(rs) => rs,
+            None => return Ok(vec![]),
+        };
+        let guard = rs.read().await;
+        Ok(guard
+            .intervals
+            .iter()
+            .filter_map(|i| match &i.kind {
+                IntervalKind::Booking { label } => Some(BookingInfo {
+                    id: i.id,
+                    resource_id,
+                    start: i.span.start,
+                    end: i.span.end,
+                    label: label.clone(),
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    pub async fn get_holds(&self, resource_id: Ulid) -> Result<Vec<HoldInfo>, EngineError> {
+        let rs = match self.get_resource(&resource_id) {
+            Some(rs) => rs,
+            None => return Ok(vec![]),
+        };
+        let guard = rs.read().await;
+        Ok(guard
+            .intervals
+            .iter()
+            .filter_map(|i| match &i.kind {
+                IntervalKind::Hold { expires_at } => Some(HoldInfo {
+                    id: i.id,
+                    resource_id,
+                    start: i.span.start,
+                    end: i.span.end,
+                    expires_at: *expires_at,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    // ── Updates ──────────────────────────────────────────────────
+
+    pub async fn update_resource(
+        &self,
+        id: Ulid,
+        name: Option<String>,
+        capacity: u32,
+        buffer_after: Option<Ms>,
+    ) -> Result<(), EngineError> {
+        let rs = self
+            .get_resource(&id)
+            .ok_or(EngineError::NotFound(id))?;
+        let mut guard = rs.write().await;
+
+        let event = Event::ResourceUpdated { id, name, capacity, buffer_after };
+        self.wal_append(&event).await?;
+        apply_to_resource(&mut guard, &event, &self.entity_to_resource);
+        self.notify.send(id, &event);
+        Ok(())
+    }
+
+    pub async fn update_rule(
+        &self,
+        id: Ulid,
+        span: Span,
+        blocking: bool,
+    ) -> Result<Ulid, EngineError> {
+        let resource_id = self
+            .get_resource_for_entity(&id)
+            .ok_or(EngineError::NotFound(id))?;
+        let rs = self
+            .get_resource(&resource_id)
+            .ok_or(EngineError::NotFound(resource_id))?;
+        let mut guard = rs.write().await;
+
+        let event = Event::RuleUpdated { id, resource_id, span, blocking };
+        self.wal_append(&event).await?;
+        apply_to_resource(&mut guard, &event, &self.entity_to_resource);
+        self.notify.send(resource_id, &event);
+        Ok(resource_id)
+    }
+
     pub fn collect_expired_holds(&self, now: Ms) -> Vec<(Ulid, Ulid)> {
         let mut expired = Vec::new();
         for entry in self.state.iter() {
@@ -546,6 +885,104 @@ impl Engine {
         }
         expired
     }
+
+    /// Compact the WAL by rewriting it with only the events needed to recreate the current state.
+    /// This removes all historical churn (deleted resources, removed rules, cancelled bookings).
+    pub async fn compact_wal(&self) -> Result<(), EngineError> {
+        // Collect current state as minimal events, topologically ordered (parents before children).
+        let mut events = Vec::new();
+        let mut visited = HashSet::new();
+
+        // Topological emit: ensure parent is emitted before child.
+        fn emit_resource(
+            id: Ulid,
+            state: &DashMap<Ulid, SharedResourceState>,
+            events: &mut Vec<Event>,
+            visited: &mut HashSet<Ulid>,
+        ) {
+            if !visited.insert(id) {
+                return;
+            }
+            let entry = match state.get(&id) {
+                Some(e) => e,
+                None => return,
+            };
+            let rs = entry.value().clone();
+            let guard = rs.try_read().expect("compact: uncontended read");
+
+            // Emit parent first
+            if let Some(pid) = guard.parent_id {
+                emit_resource(pid, state, events, visited);
+            }
+
+            events.push(Event::ResourceCreated {
+                id: guard.id,
+                parent_id: guard.parent_id,
+                name: guard.name.clone(),
+                capacity: guard.capacity,
+                buffer_after: guard.buffer_after,
+            });
+
+            // Emit current intervals
+            for interval in &guard.intervals {
+                match &interval.kind {
+                    IntervalKind::NonBlocking => events.push(Event::RuleAdded {
+                        id: interval.id,
+                        resource_id: guard.id,
+                        span: interval.span,
+                        blocking: false,
+                    }),
+                    IntervalKind::Blocking => events.push(Event::RuleAdded {
+                        id: interval.id,
+                        resource_id: guard.id,
+                        span: interval.span,
+                        blocking: true,
+                    }),
+                    IntervalKind::Hold { expires_at } => events.push(Event::HoldPlaced {
+                        id: interval.id,
+                        resource_id: guard.id,
+                        span: interval.span,
+                        expires_at: *expires_at,
+                    }),
+                    IntervalKind::Booking { label } => events.push(Event::BookingConfirmed {
+                        id: interval.id,
+                        resource_id: guard.id,
+                        span: interval.span,
+                        label: label.clone(),
+                    }),
+                }
+            }
+        }
+
+        // Emit all resources
+        let resource_ids: Vec<Ulid> = self.state.iter().map(|e| *e.key()).collect();
+        for id in resource_ids {
+            emit_resource(id, &self.state, &mut events, &mut visited);
+        }
+
+        // Send compact command to WAL writer (handles write_compact_file + swap atomically)
+        let (tx, rx) = oneshot::channel();
+        self.wal_tx
+            .send(WalCommand::Compact { events, response: tx })
+            .await
+            .map_err(|_| EngineError::WalError("WAL writer shut down".into()))?;
+        rx.await
+            .map_err(|_| EngineError::WalError("WAL writer dropped response".into()))?
+            .map_err(|e| EngineError::WalError(e.to_string()))
+    }
+
+    pub async fn wal_appends_since_compact(&self) -> u64 {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .wal_tx
+            .send(WalCommand::AppendsSinceCompact { response: tx })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        rx.await.unwrap_or(0)
+    }
 }
 
 fn now_ms() -> Ms {
@@ -559,11 +996,13 @@ fn now_ms() -> Ms {
 fn event_resource_id(event: &Event) -> Option<Ulid> {
     match event {
         Event::RuleAdded { resource_id, .. }
+        | Event::RuleUpdated { resource_id, .. }
         | Event::RuleRemoved { resource_id, .. }
         | Event::HoldPlaced { resource_id, .. }
         | Event::HoldReleased { resource_id, .. }
         | Event::BookingConfirmed { resource_id, .. }
         | Event::BookingCancelled { resource_id, .. } => Some(*resource_id),
+        Event::ResourceUpdated { id, .. } => Some(*id),
         Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } => None,
     }
 }
@@ -582,7 +1021,7 @@ fn check_no_conflict(rs: &ResourceState, span: &Span, now: Ms) -> Result<(), Eng
         for interval in rs.overlapping(&search_span) {
             match &interval.kind {
                 IntervalKind::Hold { expires_at } if *expires_at <= now => continue,
-                IntervalKind::Hold { .. } | IntervalKind::Booking => {
+                IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {
                     let effective_end = interval.span.end + buffer;
                     let effective = Span::new(interval.span.start, effective_end);
                     if effective.overlaps(span) {
@@ -618,7 +1057,7 @@ fn collect_active_allocs_with_buffer(
     for interval in rs.overlapping(query) {
         match &interval.kind {
             IntervalKind::Hold { expires_at } if *expires_at <= now => continue,
-            IntervalKind::Hold { .. } | IntervalKind::Booking => {
+            IntervalKind::Hold { .. } | IntervalKind::Booking { .. } => {
                 let effective_end = interval.span.end + buffer;
                 allocs.push(Span::new(interval.span.start, effective_end));
             }
@@ -707,7 +1146,7 @@ pub fn availability(
                 let effective_end = interval.span.end + buffer;
                 active_allocs.push(Span::new(interval.span.start, effective_end));
             }
-            IntervalKind::Booking => {
+            IntervalKind::Booking { .. } => {
                 let effective_end = interval.span.end + buffer;
                 active_allocs.push(Span::new(interval.span.start, effective_end));
             }
@@ -852,7 +1291,7 @@ mod tests {
     }
 
     fn make_resource_with_capacity(intervals: Vec<Interval>, capacity: u32, buffer_after: Option<Ms>) -> ResourceState {
-        let mut rs = ResourceState::new(Ulid::new(), None, capacity, buffer_after);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, capacity, buffer_after);
         for i in intervals {
             rs.insert_interval(i);
         }
@@ -875,7 +1314,7 @@ mod tests {
         Interval {
             id: Ulid::new(),
             span: Span::new(start, end),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         }
     }
 
@@ -1068,7 +1507,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let id = Ulid::new();
-        engine.create_resource(id, None, 1, None).await.unwrap();
+        engine.create_resource(id, None, None, 1, None).await.unwrap();
 
         let rs = engine.get_resource(&id).unwrap();
         let guard = rs.read().await;
@@ -1082,10 +1521,10 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         let rs = engine.get_resource(&child).unwrap();
         let guard = rs.read().await;
@@ -1099,7 +1538,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let result = engine
-            .create_resource(Ulid::new(), Some(Ulid::new()), 1, None)
+            .create_resource(Ulid::new(), Some(Ulid::new()), None, 1, None)
             .await;
         assert!(matches!(result, Err(EngineError::NotFound(_))));
     }
@@ -1111,7 +1550,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let id = Ulid::new();
-        let result = engine.create_resource(id, Some(id), 1, None).await;
+        let result = engine.create_resource(id, Some(id), None, 1, None).await;
         assert!(matches!(result, Err(EngineError::CycleDetected(_))));
     }
 
@@ -1122,8 +1561,8 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let id = Ulid::new();
-        engine.create_resource(id, None, 1, None).await.unwrap();
-        let result = engine.create_resource(id, None, 1, None).await;
+        engine.create_resource(id, None, None, 1, None).await.unwrap();
+        let result = engine.create_resource(id, None, None, 1, None).await;
         assert!(matches!(result, Err(EngineError::AlreadyExists(_))));
     }
 
@@ -1134,9 +1573,9 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         let result = engine.delete_resource(parent).await;
         assert!(matches!(result, Err(EngineError::HasChildren(_))));
@@ -1149,14 +1588,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         let avail = engine
             .compute_availability(child, 0, 24 * H, None)
@@ -1172,7 +1611,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
@@ -1183,7 +1622,7 @@ mod tests {
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         let avail = engine
             .compute_availability(child, 0, 24 * H, None)
@@ -1202,14 +1641,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), child, Span::new(14 * H, 16 * H), false)
             .await
@@ -1229,7 +1668,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let theater = Ulid::new();
-        engine.create_resource(theater, None, 1, None).await.unwrap();
+        engine.create_resource(theater, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), theater, Span::new(9 * H, 23 * H), false)
             .await
@@ -1237,7 +1676,7 @@ mod tests {
 
         let screen = Ulid::new();
         engine
-            .create_resource(screen, Some(theater), 1, None)
+            .create_resource(screen, Some(theater), None, 1, None)
             .await
             .unwrap();
         engine
@@ -1256,7 +1695,7 @@ mod tests {
             .unwrap();
 
         let seat = Ulid::new();
-        engine.create_resource(seat, Some(screen), 1, None).await.unwrap();
+        engine.create_resource(seat, Some(screen), None, 1, None).await.unwrap();
 
         let avail = engine
             .compute_availability(seat, 0, 24 * H, None)
@@ -1275,14 +1714,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         let result = engine
             .add_rule(Ulid::new(), child, Span::new(8 * H, 10 * H), false)
@@ -1300,14 +1739,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), child, Span::new(8 * H, 10 * H), true)
@@ -1322,13 +1761,13 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), rid, Span::new(9 * H, 12 * H), false)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(10 * H, 10 * H + 15 * M))
+            .confirm_booking(Ulid::new(), rid, Span::new(10 * H, 10 * H + 15 * M), None)
             .await
             .unwrap();
 
@@ -1353,7 +1792,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         let far_future = now_ms() + 3_600_000;
         engine
@@ -1376,9 +1815,9 @@ mod tests {
         let parent = Ulid::new();
         {
             let engine = Engine::new(path.clone(), notify.clone()).unwrap();
-            engine.create_resource(parent, None, 1, None).await.unwrap();
+            engine.create_resource(parent, None, None, 1, None).await.unwrap();
             engine
-                .create_resource(rid, Some(parent), 1, None)
+                .create_resource(rid, Some(parent), None, 1, None)
                 .await
                 .unwrap();
         }
@@ -1396,7 +1835,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         let rule_id = Ulid::new();
         engine
@@ -1426,11 +1865,11 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         let bid = Ulid::new();
         engine
-            .confirm_booking(bid, rid, Span::new(1000, 2000))
+            .confirm_booking(bid, rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
 
@@ -1456,7 +1895,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         let hid = Ulid::new();
         let far_future = now_ms() + 3_600_000;
@@ -1633,7 +2072,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let chain = Ulid::new();
-        engine.create_resource(chain, None, 1, None).await.unwrap();
+        engine.create_resource(chain, None, None, 1, None).await.unwrap();
         // Chain open 24/7
         engine
             .add_rule(Ulid::new(), chain, Span::new(0, 24 * H), false)
@@ -1642,7 +2081,7 @@ mod tests {
 
         let hotel = Ulid::new();
         engine
-            .create_resource(hotel, Some(chain), 1, None)
+            .create_resource(hotel, Some(chain), None, 1, None)
             .await
             .unwrap();
         // Hotel-level maintenance 3am-5am
@@ -1653,14 +2092,14 @@ mod tests {
 
         let floor = Ulid::new();
         engine
-            .create_resource(floor, Some(hotel), 1, None)
+            .create_resource(floor, Some(hotel), None, 1, None)
             .await
             .unwrap();
         // Floor-level: no own rules, inherits chain's 24/7
 
         let room = Ulid::new();
         engine
-            .create_resource(room, Some(floor), 1, None)
+            .create_resource(room, Some(floor), None, 1, None)
             .await
             .unwrap();
 
@@ -1683,7 +2122,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let grandparent = Ulid::new();
-        engine.create_resource(grandparent, None, 1, None).await.unwrap();
+        engine.create_resource(grandparent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), grandparent, Span::new(9 * H, 17 * H), false)
             .await
@@ -1691,7 +2130,7 @@ mod tests {
 
         let parent = Ulid::new();
         engine
-            .create_resource(parent, Some(grandparent), 1, None)
+            .create_resource(parent, Some(grandparent), None, 1, None)
             .await
             .unwrap();
         // Parent has only blocking, no non-blocking
@@ -1702,7 +2141,7 @@ mod tests {
 
         let child = Ulid::new();
         engine
-            .create_resource(child, Some(parent), 1, None)
+            .create_resource(child, Some(parent), None, 1, None)
             .await
             .unwrap();
 
@@ -1725,7 +2164,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
@@ -1734,17 +2173,17 @@ mod tests {
         let child_a = Ulid::new();
         let child_b = Ulid::new();
         engine
-            .create_resource(child_a, Some(parent), 1, None)
+            .create_resource(child_a, Some(parent), None, 1, None)
             .await
             .unwrap();
         engine
-            .create_resource(child_b, Some(parent), 1, None)
+            .create_resource(child_b, Some(parent), None, 1, None)
             .await
             .unwrap();
 
         // Book child_a solid 9-5
         engine
-            .confirm_booking(Ulid::new(), child_a, Span::new(9 * H, 17 * H))
+            .confirm_booking(Ulid::new(), child_a, Span::new(9 * H, 17 * H), None)
             .await
             .unwrap();
 
@@ -1772,7 +2211,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
@@ -1780,13 +2219,13 @@ mod tests {
 
         let child = Ulid::new();
         engine
-            .create_resource(child, Some(parent), 1, None)
+            .create_resource(child, Some(parent), None, 1, None)
             .await
             .unwrap();
 
         // Book child at 10-11
         engine
-            .confirm_booking(Ulid::new(), child, Span::new(10 * H, 11 * H))
+            .confirm_booking(Ulid::new(), child, Span::new(10 * H, 11 * H), None)
             .await
             .unwrap();
 
@@ -1819,7 +2258,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 12 * H), false)
             .await
@@ -1827,7 +2266,7 @@ mod tests {
 
         let child = Ulid::new();
         engine
-            .create_resource(child, Some(parent), 1, None)
+            .create_resource(child, Some(parent), None, 1, None)
             .await
             .unwrap();
 
@@ -1860,9 +2299,9 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         // Can't delete parent while child exists
         assert!(matches!(
@@ -1887,8 +2326,8 @@ mod tests {
         let child = Ulid::new();
         {
             let engine = Engine::new(path.clone(), notify.clone()).unwrap();
-            engine.create_resource(parent, None, 1, None).await.unwrap();
-            engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+            engine.create_resource(parent, None, None, 1, None).await.unwrap();
+            engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
         }
 
         // Replay from WAL — children index should be rebuilt
@@ -1908,7 +2347,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let grandparent = Ulid::new();
-        engine.create_resource(grandparent, None, 1, None).await.unwrap();
+        engine.create_resource(grandparent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), grandparent, Span::new(0, 24 * H), false)
             .await
@@ -1921,7 +2360,7 @@ mod tests {
 
         let parent = Ulid::new();
         engine
-            .create_resource(parent, Some(grandparent), 1, None)
+            .create_resource(parent, Some(grandparent), None, 1, None)
             .await
             .unwrap();
         // Parent blocks 5am-6am
@@ -1932,7 +2371,7 @@ mod tests {
 
         let child = Ulid::new();
         engine
-            .create_resource(child, Some(parent), 1, None)
+            .create_resource(child, Some(parent), None, 1, None)
             .await
             .unwrap();
 
@@ -1963,7 +2402,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         let far_future = now_ms() + H;
         engine
@@ -1984,15 +2423,15 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
 
         let result = engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1500, 2500))
+            .confirm_booking(Ulid::new(), rid, Span::new(1500, 2500), None)
             .await;
         assert!(matches!(result, Err(EngineError::Conflict(_))));
     }
@@ -2004,7 +2443,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         // Place a hold that's already expired
         let past = now_ms() - 10_000;
@@ -2015,7 +2454,7 @@ mod tests {
 
         // Booking should succeed because hold is expired
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
     }
@@ -2028,7 +2467,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         let now = now_ms();
         engine
@@ -2038,7 +2477,7 @@ mod tests {
 
         // Should succeed — hold at exact `now` is expired
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
     }
@@ -2055,14 +2494,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         // Exactly at parent boundaries — should succeed
         engine
@@ -2079,14 +2518,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), parent, Span::new(9 * H, 17 * H), false)
             .await
             .unwrap();
 
         let child = Ulid::new();
-        engine.create_resource(child, Some(parent), 1, None).await.unwrap();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
 
         // 1ms before parent start
         let result = engine
@@ -2106,7 +2545,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let grandparent = Ulid::new();
-        engine.create_resource(grandparent, None, 1, None).await.unwrap();
+        engine.create_resource(grandparent, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), grandparent, Span::new(0, 24 * H), false)
             .await
@@ -2114,7 +2553,7 @@ mod tests {
 
         let parent = Ulid::new();
         engine
-            .create_resource(parent, Some(grandparent), 1, None)
+            .create_resource(parent, Some(grandparent), None, 1, None)
             .await
             .unwrap();
         // Parent narrows to 9-17
@@ -2125,7 +2564,7 @@ mod tests {
 
         let child = Ulid::new();
         engine
-            .create_resource(child, Some(parent), 1, None)
+            .create_resource(child, Some(parent), None, 1, None)
             .await
             .unwrap();
 
@@ -2157,7 +2596,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         // One big availability rule
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 1_000_000), false)
@@ -2168,7 +2607,7 @@ mod tests {
         for i in 0..500 {
             let start = (i * 1000) + 100;
             engine
-                .confirm_booking(Ulid::new(), rid, Span::new(start, start + 1))
+                .confirm_booking(Ulid::new(), rid, Span::new(start, start + 1), None)
                 .await
                 .unwrap();
         }
@@ -2193,13 +2632,13 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), rid, Span::new(100, 200), false)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(150, 175))
+            .confirm_booking(Ulid::new(), rid, Span::new(150, 175), None)
             .await
             .unwrap();
 
@@ -2221,14 +2660,14 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, H), false)
             .await
             .unwrap();
         // Two bookings leave only 20-min gaps
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(20 * M, 40 * M))
+            .confirm_booking(Ulid::new(), rid, Span::new(20 * M, 40 * M), None)
             .await
             .unwrap();
 
@@ -2252,7 +2691,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), rid, Span::new(9 * H, 17 * H), false)
             .await
@@ -2283,7 +2722,7 @@ mod tests {
         // Step 3: Confirm booking at same slot
         let booking_id = Ulid::new();
         engine
-            .confirm_booking(booking_id, rid, Span::new(10 * H, 11 * H))
+            .confirm_booking(booking_id, rid, Span::new(10 * H, 11 * H), None)
             .await
             .unwrap();
 
@@ -2319,7 +2758,7 @@ mod tests {
 
         // Practice: open 8am-6pm
         let practice = Ulid::new();
-        engine.create_resource(practice, None, 1, None).await.unwrap();
+        engine.create_resource(practice, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), practice, Span::new(8 * H, 18 * H), false)
             .await
@@ -2333,7 +2772,7 @@ mod tests {
         // Dr. Smith: works 9am-12pm and 1pm-5pm (respects practice lunch block)
         let dr_smith = Ulid::new();
         engine
-            .create_resource(dr_smith, Some(practice), 1, None)
+            .create_resource(dr_smith, Some(practice), None, 1, None)
             .await
             .unwrap();
         engine
@@ -2358,14 +2797,14 @@ mod tests {
         // Patient A: 30-min appointment at 9:00
         let patient_a = Ulid::new();
         engine
-            .confirm_booking(patient_a, dr_smith, Span::new(9 * H, 9 * H + 30 * M))
+            .confirm_booking(patient_a, dr_smith, Span::new(9 * H, 9 * H + 30 * M), None)
             .await
             .unwrap();
 
         // Patient B: 60-min appointment at 14:00
         let patient_b = Ulid::new();
         engine
-            .confirm_booking(patient_b, dr_smith, Span::new(14 * H, 15 * H))
+            .confirm_booking(patient_b, dr_smith, Span::new(14 * H, 15 * H), None)
             .await
             .unwrap();
 
@@ -2419,7 +2858,7 @@ mod tests {
 
         // Theater: open 9am-11pm
         let theater = Ulid::new();
-        engine.create_resource(theater, None, 1, None).await.unwrap();
+        engine.create_resource(theater, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), theater, Span::new(9 * H, 23 * H), false)
             .await
@@ -2428,7 +2867,7 @@ mod tests {
         // Screen 1: two showings
         let screen = Ulid::new();
         engine
-            .create_resource(screen, Some(theater), 1, None)
+            .create_resource(screen, Some(theater), None, 1, None)
             .await
             .unwrap();
         // Showing 1: 2pm-4pm (includes 15min cleanup at the end)
@@ -2446,7 +2885,7 @@ mod tests {
         let mut seats = Vec::new();
         for _ in 0..10 {
             let seat = Ulid::new();
-            engine.create_resource(seat, Some(screen), 1, None).await.unwrap();
+            engine.create_resource(seat, Some(screen), None, 1, None).await.unwrap();
             seats.push(seat);
         }
 
@@ -2464,7 +2903,7 @@ mod tests {
         // Book 8 of 10 seats for showing 1
         for &seat_id in &seats[..8] {
             engine
-                .confirm_booking(Ulid::new(), seat_id, Span::new(14 * H, 16 * H))
+                .confirm_booking(Ulid::new(), seat_id, Span::new(14 * H, 16 * H), None)
                 .await
                 .unwrap();
         }
@@ -2506,7 +2945,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let theater = Ulid::new();
-        engine.create_resource(theater, None, 1, None).await.unwrap();
+        engine.create_resource(theater, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), theater, Span::new(0, 24 * H), false)
             .await
@@ -2514,7 +2953,7 @@ mod tests {
 
         let screen = Ulid::new();
         engine
-            .create_resource(screen, Some(theater), 1, None)
+            .create_resource(screen, Some(theater), None, 1, None)
             .await
             .unwrap();
         engine
@@ -2526,12 +2965,12 @@ mod tests {
         let mut booking_ids = Vec::new();
         for _ in 0..5 {
             let seat = Ulid::new();
-            engine.create_resource(seat, Some(screen), 1, None).await.unwrap();
+            engine.create_resource(seat, Some(screen), None, 1, None).await.unwrap();
             seats.push(seat);
 
             let bid = Ulid::new();
             engine
-                .confirm_booking(bid, seat, Span::new(14 * H, 16 * H))
+                .confirm_booking(bid, seat, Span::new(14 * H, 16 * H), None)
                 .await
                 .unwrap();
             booking_ids.push(bid);
@@ -2577,7 +3016,7 @@ mod tests {
 
         // Hotel: always available
         let hotel = Ulid::new();
-        engine.create_resource(hotel, None, 1, None).await.unwrap();
+        engine.create_resource(hotel, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), hotel, Span::new(0, 30 * day), false) // 30 days
             .await
@@ -2586,7 +3025,7 @@ mod tests {
         // Room 101
         let room = Ulid::new();
         engine
-            .create_resource(room, Some(hotel), 1, None)
+            .create_resource(room, Some(hotel), None, 1, None)
             .await
             .unwrap();
 
@@ -2595,7 +3034,7 @@ mod tests {
         let checkout_a = 8 * day + 12 * H; // noon day 8
         let booking_a = Ulid::new();
         engine
-            .confirm_booking(booking_a, room, Span::new(checkin_a, checkout_a))
+            .confirm_booking(booking_a, room, Span::new(checkin_a, checkout_a), None)
             .await
             .unwrap();
 
@@ -2617,13 +3056,13 @@ mod tests {
 
         // Guest B: can book starting 2pm day 8
         engine
-            .confirm_booking(Ulid::new(), room, Span::new(checkout_a + 2 * H, 10 * day + 12 * H))
+            .confirm_booking(Ulid::new(), room, Span::new(checkout_a + 2 * H, 10 * day + 12 * H), None)
             .await
             .unwrap();
 
         // Guest B can't also book the cleaning slot
-        let result = engine
-            .confirm_booking(Ulid::new(), room, Span::new(checkout_a, checkout_a + H))
+        let _result = engine
+            .confirm_booking(Ulid::new(), room, Span::new(checkout_a, checkout_a + H), None)
             .await;
         // This should fail because the cleaning time has no availability (blocking rule)
         // Actually, conflict check only checks against allocations, not rules.
@@ -2651,7 +3090,7 @@ mod tests {
 
         // Tenant A: gym with rooms
         let gym = Ulid::new();
-        engine.create_resource(gym, None, 1, None).await.unwrap();
+        engine.create_resource(gym, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), gym, Span::new(6 * H, 22 * H), false) // 6am-10pm
             .await
@@ -2659,13 +3098,13 @@ mod tests {
 
         let yoga_room = Ulid::new();
         engine
-            .create_resource(yoga_room, Some(gym), 1, None)
+            .create_resource(yoga_room, Some(gym), None, 1, None)
             .await
             .unwrap();
 
         // Tenant B: restaurant with tables
         let restaurant = Ulid::new();
-        engine.create_resource(restaurant, None, 1, None).await.unwrap();
+        engine.create_resource(restaurant, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), restaurant, Span::new(11 * H, 23 * H), false) // 11am-11pm
             .await
@@ -2673,13 +3112,13 @@ mod tests {
 
         let table_1 = Ulid::new();
         engine
-            .create_resource(table_1, Some(restaurant), 1, None)
+            .create_resource(table_1, Some(restaurant), None, 1, None)
             .await
             .unwrap();
 
         // Book yoga room solid
         engine
-            .confirm_booking(Ulid::new(), yoga_room, Span::new(6 * H, 22 * H))
+            .confirm_booking(Ulid::new(), yoga_room, Span::new(6 * H, 22 * H), None)
             .await
             .unwrap();
 
@@ -2693,7 +3132,7 @@ mod tests {
         // Can't create cross-tenant child
         let orphan = Ulid::new();
         engine
-            .create_resource(orphan, Some(gym), 1, None)
+            .create_resource(orphan, Some(gym), None, 1, None)
             .await
             .unwrap();
         // orphan is under gym — not under restaurant. Totally separate.
@@ -2716,7 +3155,7 @@ mod tests {
 
         // Garage: open 6am-midnight
         let garage = Ulid::new();
-        engine.create_resource(garage, None, 1, None).await.unwrap();
+        engine.create_resource(garage, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), garage, Span::new(6 * H, 24 * H), false)
             .await
@@ -2725,14 +3164,14 @@ mod tests {
         // Floor 1: regular parking
         let floor1 = Ulid::new();
         engine
-            .create_resource(floor1, Some(garage), 1, None)
+            .create_resource(floor1, Some(garage), None, 1, None)
             .await
             .unwrap();
 
         // Floor 2: EV only, restricted hours 8am-8pm
         let floor2 = Ulid::new();
         engine
-            .create_resource(floor2, Some(garage), 1, None)
+            .create_resource(floor2, Some(garage), None, 1, None)
             .await
             .unwrap();
         engine
@@ -2743,14 +3182,14 @@ mod tests {
         // Spots on floor 1 (inherit garage hours 6am-midnight)
         let spot_a = Ulid::new();
         engine
-            .create_resource(spot_a, Some(floor1), 1, None)
+            .create_resource(spot_a, Some(floor1), None, 1, None)
             .await
             .unwrap();
 
         // Spots on floor 2 (inherit floor2 hours 8am-8pm, overriding garage)
         let ev_spot = Ulid::new();
         engine
-            .create_resource(ev_spot, Some(floor2), 1, None)
+            .create_resource(ev_spot, Some(floor2), None, 1, None)
             .await
             .unwrap();
 
@@ -2768,7 +3207,7 @@ mod tests {
 
         // Park a car in spot_a from 9am-5pm
         engine
-            .confirm_booking(Ulid::new(), spot_a, Span::new(9 * H, 17 * H))
+            .confirm_booking(Ulid::new(), spot_a, Span::new(9 * H, 17 * H), None)
             .await
             .unwrap();
 
@@ -2818,7 +3257,7 @@ mod tests {
 
         // Building: open 7am-10pm
         let building = Ulid::new();
-        engine.create_resource(building, None, 1, None).await.unwrap();
+        engine.create_resource(building, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), building, Span::new(7 * H, 22 * H), false)
             .await
@@ -2827,28 +3266,28 @@ mod tests {
         // Conference room: bookable in 30-min slots (client-side concern)
         let conf_room = Ulid::new();
         engine
-            .create_resource(conf_room, Some(building), 1, None)
+            .create_resource(conf_room, Some(building), None, 1, None)
             .await
             .unwrap();
 
         // Hot desk area: same hours as building
         let hot_desk = Ulid::new();
         engine
-            .create_resource(hot_desk, Some(building), 1, None)
+            .create_resource(hot_desk, Some(building), None, 1, None)
             .await
             .unwrap();
 
         // Morning: 3 conference bookings back to back
         engine
-            .confirm_booking(Ulid::new(), conf_room, Span::new(9 * H, 9 * H + 30 * M))
+            .confirm_booking(Ulid::new(), conf_room, Span::new(9 * H, 9 * H + 30 * M), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), conf_room, Span::new(9 * H + 30 * M, 10 * H))
+            .confirm_booking(Ulid::new(), conf_room, Span::new(9 * H + 30 * M, 10 * H), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), conf_room, Span::new(10 * H, 10 * H + 30 * M))
+            .confirm_booking(Ulid::new(), conf_room, Span::new(10 * H, 10 * H + 30 * M), None)
             .await
             .unwrap();
 
@@ -2893,7 +3332,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let parent = Ulid::new();
-        engine.create_resource(parent, None, 1, None).await.unwrap();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
         let rule_id = Ulid::new();
         engine
             .add_rule(rule_id, parent, Span::new(9 * H, 17 * H), false)
@@ -2902,7 +3341,7 @@ mod tests {
 
         let child = Ulid::new();
         engine
-            .create_resource(child, Some(parent), 1, None)
+            .create_resource(child, Some(parent), None, 1, None)
             .await
             .unwrap();
 
@@ -2931,7 +3370,7 @@ mod tests {
         let engine = Engine::new(path, notify).unwrap();
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
         engine
             .add_rule(Ulid::new(), rid, Span::new(9 * H, 17 * H), false)
             .await
@@ -2968,7 +3407,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 2, None).await.unwrap();
+        engine.create_resource(rid, None, None, 2, None).await.unwrap();
 
         // Add availability
         engine
@@ -2978,11 +3417,11 @@ mod tests {
 
         // Two bookings on the same span — capacity=2, both should succeed
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
     }
@@ -2994,7 +3433,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 2, None).await.unwrap();
+        engine.create_resource(rid, None, None, 2, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 10000), false)
@@ -3002,17 +3441,17 @@ mod tests {
             .unwrap();
 
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
 
         // Third booking should fail — capacity exceeded
         let result = engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await;
         assert!(result.is_err());
     }
@@ -3024,7 +3463,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 10000), false)
@@ -3040,7 +3479,7 @@ mod tests {
 
         // Booking should succeed because the hold is expired
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
     }
@@ -3052,7 +3491,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 10000), false)
@@ -3060,13 +3499,13 @@ mod tests {
             .unwrap();
 
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
 
         // Second booking should fail — capacity=1
         let result = engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await;
         assert!(matches!(result, Err(EngineError::Conflict(_))));
     }
@@ -3078,7 +3517,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 3, None).await.unwrap();
+        engine.create_resource(rid, None, None, 3, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 10000), false)
@@ -3087,11 +3526,11 @@ mod tests {
 
         // Book 2 of 3 slots
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
 
@@ -3110,7 +3549,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 2, None).await.unwrap();
+        engine.create_resource(rid, None, None, 2, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 10000), false)
@@ -3119,11 +3558,11 @@ mod tests {
 
         // Fill capacity
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 2000), None)
             .await
             .unwrap();
 
@@ -3149,7 +3588,7 @@ mod tests {
         let rid = Ulid::new();
         let buffer_30min: Ms = 30 * 60 * 1000; // 30 minutes in ms
         engine
-            .create_resource(rid, None, 1, Some(buffer_30min))
+            .create_resource(rid, None, None, 1, Some(buffer_30min))
             .await
             .unwrap();
 
@@ -3161,7 +3600,7 @@ mod tests {
 
         // Booking from 10:00 to 11:00
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(10 * h, 11 * h))
+            .confirm_booking(Ulid::new(), rid, Span::new(10 * h, 11 * h), None)
             .await
             .unwrap();
 
@@ -3187,7 +3626,7 @@ mod tests {
         let rid = Ulid::new();
         let buffer_1h: Ms = 3_600_000;
         engine
-            .create_resource(rid, None, 1, Some(buffer_1h))
+            .create_resource(rid, None, None, 1, Some(buffer_1h))
             .await
             .unwrap();
 
@@ -3198,13 +3637,13 @@ mod tests {
 
         // Two bookings — should not be able to book immediately after the first
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(0, 10_000_000))
+            .confirm_booking(Ulid::new(), rid, Span::new(0, 10_000_000), None)
             .await
             .unwrap();
 
         // This booking starts right at the first's end, but buffer should block it
         let result = engine
-            .confirm_booking(Ulid::new(), rid, Span::new(10_000_000, 20_000_000))
+            .confirm_booking(Ulid::new(), rid, Span::new(10_000_000, 20_000_000), None)
             .await;
         assert!(result.is_err());
 
@@ -3214,6 +3653,7 @@ mod tests {
                 Ulid::new(),
                 rid,
                 Span::new(10_000_000 + buffer_1h, 20_000_000 + buffer_1h),
+                None,
             )
             .await
             .unwrap();
@@ -3226,7 +3666,7 @@ mod tests {
         let engine = Arc::new(Engine::new(path, notify).unwrap());
 
         let rid = Ulid::new();
-        engine.create_resource(rid, None, 1, None).await.unwrap();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
 
         engine
             .add_rule(Ulid::new(), rid, Span::new(0, 100_000), false)
@@ -3234,13 +3674,13 @@ mod tests {
             .unwrap();
 
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(0, 50_000))
+            .confirm_booking(Ulid::new(), rid, Span::new(0, 50_000), None)
             .await
             .unwrap();
 
         // Adjacent booking should succeed with no buffer
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(50_000, 100_000))
+            .confirm_booking(Ulid::new(), rid, Span::new(50_000, 100_000), None)
             .await
             .unwrap();
     }
@@ -3256,7 +3696,7 @@ mod tests {
         let rid = Ulid::new();
         let buffer = 1000_i64;
         engine
-            .create_resource(rid, None, 2, Some(buffer))
+            .create_resource(rid, None, None, 2, Some(buffer))
             .await
             .unwrap();
 
@@ -3267,23 +3707,23 @@ mod tests {
 
         // Two bookings on same slot (capacity=2) — both succeed
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000), None)
             .await
             .unwrap();
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000), None)
             .await
             .unwrap();
 
         // Third fails (capacity exceeded)
         let result = engine
-            .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000))
+            .confirm_booking(Ulid::new(), rid, Span::new(1000, 5000), None)
             .await;
         assert!(result.is_err());
 
         // Booking right after buffer should work for 1 slot
         engine
-            .confirm_booking(Ulid::new(), rid, Span::new(5000 + buffer, 10000))
+            .confirm_booking(Ulid::new(), rid, Span::new(5000 + buffer, 10000), None)
             .await
             .unwrap();
     }
@@ -3298,7 +3738,7 @@ mod tests {
 
         let class_id = Ulid::new();
         engine
-            .create_resource(class_id, None, 20, None)
+            .create_resource(class_id, None, None, 20, None)
             .await
             .unwrap();
 
@@ -3312,14 +3752,14 @@ mod tests {
         // Book 20 people
         for _ in 0..20 {
             engine
-                .confirm_booking(Ulid::new(), class_id, Span::new(9 * h, 10 * h))
+                .confirm_booking(Ulid::new(), class_id, Span::new(9 * h, 10 * h), None)
                 .await
                 .unwrap();
         }
 
         // 21st person fails
         let result = engine
-            .confirm_booking(Ulid::new(), class_id, Span::new(9 * h, 10 * h))
+            .confirm_booking(Ulid::new(), class_id, Span::new(9 * h, 10 * h), None)
             .await;
         assert!(result.is_err());
 
@@ -3344,7 +3784,7 @@ mod tests {
         let cleaning = 2 * 3_600_000_i64; // 2 hours cleaning buffer
 
         engine
-            .create_resource(room, None, 1, Some(cleaning))
+            .create_resource(room, None, None, 1, Some(cleaning))
             .await
             .unwrap();
 
@@ -3357,13 +3797,13 @@ mod tests {
         // Guest 1: checkout day 3 noon (day 0 to day 3 noon)
         let noon = day / 2;
         engine
-            .confirm_booking(Ulid::new(), room, Span::new(0, 3 * day + noon))
+            .confirm_booking(Ulid::new(), room, Span::new(0, 3 * day + noon), None)
             .await
             .unwrap();
 
         // Guest 2 cannot check in at day 3 noon (cleaning buffer)
         let result = engine
-            .confirm_booking(Ulid::new(), room, Span::new(3 * day + noon, 6 * day + noon))
+            .confirm_booking(Ulid::new(), room, Span::new(3 * day + noon, 6 * day + noon), None)
             .await;
         assert!(result.is_err());
 
@@ -3373,6 +3813,7 @@ mod tests {
                 Ulid::new(),
                 room,
                 Span::new(3 * day + noon + cleaning, 6 * day + noon),
+                None,
             )
             .await
             .unwrap();
@@ -3418,5 +3859,1384 @@ mod tests {
     fn saturated_spans_empty() {
         let sat = compute_saturated_spans(&[], 5);
         assert!(sat.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // Multi-resource availability — comprehensive edge case coverage
+    // ══════════════════════════════════════════════════════════════
+
+    // ── Basic operations ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_intersection() {
+        // Two independent resources: mechanic + plane.
+        // Intersection = when BOTH are free.
+        let path = test_wal_path("multi_avail_intersect.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let mechanic = Ulid::new();
+        engine.create_resource(mechanic, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), mechanic, Span::new(8 * H, 16 * H), false).await.unwrap();
+
+        let plane = Ulid::new();
+        engine.create_resource(plane, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), plane, Span::new(6 * H, 24 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), plane, Span::new(10 * H, 13 * H), None).await.unwrap();
+
+        // Mechanic: [8,16). Plane: [6,10) ∪ [13,24). Overlap: [8,10) ∪ [13,16)
+        let result = engine
+            .compute_multi_availability(&[mechanic, plane], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![
+            Span::new(8 * H, 10 * H),
+            Span::new(13 * H, 16 * H),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn multi_avail_union_pool() {
+        // Three mechanics, need ANY one free (pool scheduling).
+        let path = test_wal_path("multi_avail_pool.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let m1 = Ulid::new();
+        engine.create_resource(m1, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), m1, Span::new(8 * H, 12 * H), false).await.unwrap();
+
+        let m2 = Ulid::new();
+        engine.create_resource(m2, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), m2, Span::new(11 * H, 16 * H), false).await.unwrap();
+
+        let m3 = Ulid::new();
+        engine.create_resource(m3, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), m3, Span::new(15 * H, 20 * H), false).await.unwrap();
+
+        // Union (min_available = 1): [8,20) (continuous coverage)
+        let result = engine
+            .compute_multi_availability(&[m1, m2, m3], 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![Span::new(8 * H, 20 * H)]);
+
+        // At-least-2: [11,12) (m1+m2) ∪ [15,16) (m2+m3)
+        let result2 = engine
+            .compute_multi_availability(&[m1, m2, m3], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result2, vec![
+            Span::new(11 * H, 12 * H),
+            Span::new(15 * H, 16 * H),
+        ]);
+
+        // At-least-3 (ALL): no time when all 3 overlap
+        let result3 = engine
+            .compute_multi_availability(&[m1, m2, m3], 0, 24 * H, 3, None)
+            .await
+            .unwrap();
+        assert!(result3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_avail_with_min_duration() {
+        let path = test_wal_path("multi_avail_mindur.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 17 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(8 * H, 17 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), b, Span::new(10 * H, 15 * H), None).await.unwrap();
+
+        // Intersection: [8,10) = 2h, [15,17) = 2h
+        let all = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(all, vec![Span::new(8 * H, 10 * H), Span::new(15 * H, 17 * H)]);
+
+        // min_duration = 3h: both too short
+        let filtered = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, Some(3 * H))
+            .await
+            .unwrap();
+        assert!(filtered.is_empty());
+
+        // min_duration = 2h: both exactly qualify
+        let passes = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, Some(2 * H))
+            .await
+            .unwrap();
+        assert_eq!(passes.len(), 2);
+
+        // min_duration = 2h + 1ms: both just under threshold
+        let barely_miss = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, Some(2 * H + 1))
+            .await
+            .unwrap();
+        assert!(barely_miss.is_empty());
+    }
+
+    // ── Edge cases: empty / degenerate inputs ─────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_empty_resources() {
+        let path = test_wal_path("multi_avail_empty.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let result = engine
+            .compute_multi_availability(&[], 0, 100_000, 1, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_avail_min_available_zero() {
+        // min_available = 0 should return empty (nothing to satisfy)
+        let path = test_wal_path("multi_avail_min0.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let r = Ulid::new();
+        engine.create_resource(r, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), r, Span::new(0, 10000), false).await.unwrap();
+
+        let result = engine
+            .compute_multi_availability(&[r], 0, 10000, 0, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_avail_min_available_exceeds_count() {
+        // min_available > resource count: impossible, always empty
+        let path = test_wal_path("multi_avail_exceed.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(0, 10000), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(0, 10000), false).await.unwrap();
+
+        // Need 3 of 2 — impossible
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 10000, 3, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_avail_single_resource() {
+        // IN list with one resource should behave same as regular availability
+        let path = test_wal_path("multi_avail_single.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let r = Ulid::new();
+        engine.create_resource(r, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), r, Span::new(8 * H, 17 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), r, Span::new(12 * H, 13 * H), None).await.unwrap();
+
+        // Multi with min_available = 1 should match regular availability
+        let multi = engine
+            .compute_multi_availability(&[r], 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        let regular = engine
+            .compute_availability(r, 0, 24 * H, None)
+            .await
+            .unwrap();
+        assert_eq!(multi, regular);
+    }
+
+    // ── Resources with no availability ────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_one_resource_has_no_rules() {
+        // Resource with no rules has no availability → intersection is empty
+        let path = test_wal_path("multi_avail_norules.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 17 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        // No rules for b — zero availability
+
+        // Intersection: a has [8,17), b has nothing → empty
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+
+        // Union: only a has availability → [8,17)
+        let union = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(union, vec![Span::new(8 * H, 17 * H)]);
+    }
+
+    #[tokio::test]
+    async fn multi_avail_all_resources_no_availability() {
+        let path = test_wal_path("multi_avail_allnone.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Blocking rules on resources ───────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_with_blocking_rules() {
+        // Blocking rules should subtract from availability before sweep
+        let path = test_wal_path("multi_avail_blocking.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 17 * H), false).await.unwrap();
+        // Blocking 12-1pm (lunch)
+        engine.add_rule(Ulid::new(), a, Span::new(12 * H, 13 * H), true).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(8 * H, 17 * H), false).await.unwrap();
+
+        // a: [8,12) ∪ [13,17). b: [8,17).
+        // Intersection: [8,12) ∪ [13,17) (limited by a's blocking)
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![
+            Span::new(8 * H, 12 * H),
+            Span::new(13 * H, 17 * H),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn multi_avail_with_inherited_blocking() {
+        // Parent blocking rule propagates to child, affects multi-avail
+        let path = test_wal_path("multi_avail_inh_block.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        // Parent with blocking rule
+        let parent = Ulid::new();
+        engine.create_resource(parent, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), parent, Span::new(0, 24 * H), false).await.unwrap();
+        // Maintenance 2-4pm
+        engine.add_rule(Ulid::new(), parent, Span::new(14 * H, 16 * H), true).await.unwrap();
+
+        // Child inherits parent rules
+        let child = Ulid::new();
+        engine.create_resource(child, Some(parent), None, 1, None).await.unwrap();
+
+        // Independent resource
+        let other = Ulid::new();
+        engine.create_resource(other, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), other, Span::new(12 * H, 18 * H), false).await.unwrap();
+
+        // child: [0,14) ∪ [16,24). other: [12,18).
+        // Intersection: [12,14) ∪ [16,18)
+        let result = engine
+            .compute_multi_availability(&[child, other], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![
+            Span::new(12 * H, 14 * H),
+            Span::new(16 * H, 18 * H),
+        ]);
+    }
+
+    // ── Buffer interaction ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_with_buffer_after() {
+        // buffer_after should shrink availability before sweep
+        let path = test_wal_path("multi_avail_buffer.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        // Resource with 1h buffer
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, Some(H)).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 17 * H), false).await.unwrap();
+        // Booking 10-11am → effective end 12pm (with buffer)
+        engine.confirm_booking(Ulid::new(), a, Span::new(10 * H, 11 * H), None).await.unwrap();
+
+        // Resource without buffer
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(8 * H, 17 * H), false).await.unwrap();
+
+        // a availability: [8,10) ∪ [12,17) (booking 10-11 + 1h buffer = gap 10-12)
+        // b availability: [8,17)
+        // Intersection: [8,10) ∪ [12,17)
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![
+            Span::new(8 * H, 10 * H),
+            Span::new(12 * H, 17 * H),
+        ]);
+    }
+
+    // ── Capacity interaction ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_with_capacity_resource() {
+        // Resource with capacity > 1 should still have availability until saturated
+        let path = test_wal_path("multi_avail_capacity.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        // Meeting room: capacity 2
+        let room = Ulid::new();
+        engine.create_resource(room, None, None, 2, None).await.unwrap();
+        engine.add_rule(Ulid::new(), room, Span::new(8 * H, 17 * H), false).await.unwrap();
+        // One booking 10-11am — room NOT saturated (1 of 2)
+        engine.confirm_booking(Ulid::new(), room, Span::new(10 * H, 11 * H), None).await.unwrap();
+
+        // Projector: capacity 1
+        let projector = Ulid::new();
+        engine.create_resource(projector, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), projector, Span::new(8 * H, 17 * H), false).await.unwrap();
+
+        // Room still available [8,17) (capacity not saturated).
+        // Intersection: [8,17)
+        let result = engine
+            .compute_multi_availability(&[room, projector], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![Span::new(8 * H, 17 * H)]);
+
+        // Now saturate the room at 10-11am
+        engine.confirm_booking(Ulid::new(), room, Span::new(10 * H, 11 * H), None).await.unwrap();
+
+        // Room: [8,10) ∪ [11,17). Projector: [8,17).
+        // Intersection: [8,10) ∪ [11,17)
+        let result2 = engine
+            .compute_multi_availability(&[room, projector], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result2, vec![
+            Span::new(8 * H, 10 * H),
+            Span::new(11 * H, 17 * H),
+        ]);
+    }
+
+    // ── Boundary conditions ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_exact_boundary_touch() {
+        // Two resources whose availability spans share exact boundaries
+        // [8,12) and [12,17) — they touch but don't overlap
+        let path = test_wal_path("multi_avail_boundary.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 12 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(12 * H, 17 * H), false).await.unwrap();
+
+        // Intersection: no overlap (half-open intervals don't share any point)
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+
+        // Union: [8,12) ∪ [12,17) = [8,17) (continuous)
+        let union = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        // Note: sweep-line produces [8,12) then [12,17) — they're adjacent
+        // but since one ends and the next starts at the same time, count goes
+        // 0→1→0→1→0, so we should get two separate spans
+        assert_eq!(union.len(), 2);
+        assert_eq!(union[0], Span::new(8 * H, 12 * H));
+        assert_eq!(union[1], Span::new(12 * H, 17 * H));
+    }
+
+    #[tokio::test]
+    async fn multi_avail_single_ms_overlap() {
+        // Spans overlap by exactly 1ms
+        let path = test_wal_path("multi_avail_1ms.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(0, 1001), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(1000, 2000), false).await.unwrap();
+
+        // Intersection: [1000, 1001) — 1ms overlap
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 3000, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![Span::new(1000, 1001)]);
+    }
+
+    #[tokio::test]
+    async fn multi_avail_identical_spans() {
+        // All resources have exactly the same availability
+        let path = test_wal_path("multi_avail_identical.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let ids: Vec<Ulid> = (0..5).map(|_| Ulid::new()).collect();
+        for &id in &ids {
+            engine.create_resource(id, None, None, 1, None).await.unwrap();
+            engine.add_rule(Ulid::new(), id, Span::new(9 * H, 17 * H), false).await.unwrap();
+        }
+
+        // All thresholds 1-5 should return [9,17)
+        for min in 1..=5 {
+            let result = engine
+                .compute_multi_availability(&ids, 0, 24 * H, min, None)
+                .await
+                .unwrap();
+            assert_eq!(result, vec![Span::new(9 * H, 17 * H)],
+                "threshold {min} should return full span");
+        }
+
+        // Threshold 6: impossible
+        let impossible = engine
+            .compute_multi_availability(&ids, 0, 24 * H, 6, None)
+            .await
+            .unwrap();
+        assert!(impossible.is_empty());
+    }
+
+    // ── Query window clipping ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_query_clips_results() {
+        // Query window is narrower than actual availability
+        let path = test_wal_path("multi_avail_clip.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(6 * H, 22 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(8 * H, 20 * H), false).await.unwrap();
+
+        // Intersection without clip: [8,20)
+        // Query only 10am-15pm:
+        let result = engine
+            .compute_multi_availability(&[a, b], 10 * H, 15 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![Span::new(10 * H, 15 * H)]);
+    }
+
+    #[tokio::test]
+    async fn multi_avail_query_no_overlap_with_availability() {
+        // Query window entirely outside availability
+        let path = test_wal_path("multi_avail_noqoverlap.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 12 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(8 * H, 12 * H), false).await.unwrap();
+
+        // Query 20pm-24pm: no availability
+        let result = engine
+            .compute_multi_availability(&[a, b], 20 * H, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Multiple availability windows per resource ────────────────
+
+    #[tokio::test]
+    async fn multi_avail_fragmented_availability() {
+        // Resources with multiple disjoint availability windows
+        let path = test_wal_path("multi_avail_frag.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        // a: morning [8,12) and afternoon [14,18)
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 12 * H), false).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(14 * H, 18 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        // b: midday [10,16)
+        engine.add_rule(Ulid::new(), b, Span::new(10 * H, 16 * H), false).await.unwrap();
+
+        // Intersection: [10,12) (a-morning ∩ b) ∪ [14,16) (a-afternoon ∩ b)
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![
+            Span::new(10 * H, 12 * H),
+            Span::new(14 * H, 16 * H),
+        ]);
+    }
+
+    // ── Cascading overlaps ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_cascading_no_triple_overlap() {
+        // A overlaps B, B overlaps C, but A doesn't overlap C
+        let path = test_wal_path("multi_avail_cascade.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 12 * H), false).await.unwrap();
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(10 * H, 16 * H), false).await.unwrap();
+
+        let c = Ulid::new();
+        engine.create_resource(c, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), c, Span::new(14 * H, 20 * H), false).await.unwrap();
+
+        // min=1: [8,20) — continuous chain
+        let union = engine
+            .compute_multi_availability(&[a, b, c], 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(union, vec![Span::new(8 * H, 20 * H)]);
+
+        // min=2: [10,12) (a+b) ∪ [14,16) (b+c)
+        let two = engine
+            .compute_multi_availability(&[a, b, c], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(two, vec![
+            Span::new(10 * H, 12 * H),
+            Span::new(14 * H, 16 * H),
+        ]);
+
+        // min=3: empty (no triple overlap)
+        let three = engine
+            .compute_multi_availability(&[a, b, c], 0, 24 * H, 3, None)
+            .await
+            .unwrap();
+        assert!(three.is_empty());
+    }
+
+    // ── Bookings reducing availability ────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_multiple_bookings_fragment() {
+        // Multiple bookings on different resources create complex patterns
+        let path = test_wal_path("multi_avail_multi_book.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        engine.create_resource(a, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), a, Span::new(8 * H, 18 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), a, Span::new(10 * H, 11 * H), None).await.unwrap();
+        engine.confirm_booking(Ulid::new(), a, Span::new(14 * H, 15 * H), None).await.unwrap();
+        // a: [8,10) ∪ [11,14) ∪ [15,18)
+
+        let b = Ulid::new();
+        engine.create_resource(b, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), b, Span::new(8 * H, 18 * H), false).await.unwrap();
+        engine.confirm_booking(Ulid::new(), b, Span::new(9 * H, 12 * H), None).await.unwrap();
+        // b: [8,9) ∪ [12,18)
+
+        // Intersection:
+        // a: [8,10) [11,14) [15,18)
+        // b: [8,9)  [12,18)
+        // → [8,9) ∩ both, [12,14) ∩ both, [15,18) ∩ both
+        let result = engine
+            .compute_multi_availability(&[a, b], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![
+            Span::new(8 * H, 9 * H),
+            Span::new(12 * H, 14 * H),
+            Span::new(15 * H, 18 * H),
+        ]);
+    }
+
+    // ── Duplicate resource ID ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_duplicate_resource_id() {
+        // Same resource listed twice: counts as 2 for threshold purposes
+        let path = test_wal_path("multi_avail_dup.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let r = Ulid::new();
+        engine.create_resource(r, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), r, Span::new(8 * H, 17 * H), false).await.unwrap();
+
+        // Same ID twice: each contributes +1 to the count, so count=2 during [8,17)
+        let result = engine
+            .compute_multi_availability(&[r, r], 0, 24 * H, 2, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![Span::new(8 * H, 17 * H)]);
+    }
+
+    // ── Large pool scenario ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_large_pool_various_thresholds() {
+        // 10 resources, staggered start times
+        let path = test_wal_path("multi_avail_large.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..10u64 {
+            let r = Ulid::new();
+            engine.create_resource(r, None, None, 1, None).await.unwrap();
+            // Each starts 1h later: resource 0=[0,20h), resource 1=[1h,20h), ...
+            engine.add_rule(Ulid::new(), r, Span::new(i as i64 * H, 20 * H), false).await.unwrap();
+            ids.push(r);
+        }
+
+        // At time 9h, all 10 are available. At time 0h, only resource 0 is.
+        // min=1: [0,20h) — at least one is always free from 0-20h
+        let union = engine
+            .compute_multi_availability(&ids, 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(union, vec![Span::new(0, 20 * H)]);
+
+        // min=10: [9h,20h) — all 10 are free only from 9h onward
+        let all = engine
+            .compute_multi_availability(&ids, 0, 24 * H, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(all, vec![Span::new(9 * H, 20 * H)]);
+
+        // min=5: [4h,20h) — resources 0-4 all available from 4h
+        let five = engine
+            .compute_multi_availability(&ids, 0, 24 * H, 5, None)
+            .await
+            .unwrap();
+        assert_eq!(five, vec![Span::new(4 * H, 20 * H)]);
+    }
+
+    // ── Nonexistent resource ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_nonexistent_resource_ignored() {
+        let path = test_wal_path("multi_avail_notfound.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let real = Ulid::new();
+        engine.create_resource(real, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), real, Span::new(0, 10000), false).await.unwrap();
+
+        let fake = Ulid::new(); // never created — contributes 0 availability
+
+        // min_available=1, so the real resource's availability is enough
+        let result = engine
+            .compute_multi_availability(&[real, fake], 0, 10000, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(result, vec![Span::new(0, 10000)]);
+    }
+
+    // ── Vertical: mechanic + plane + hangar ───────────────────────
+
+    #[tokio::test]
+    async fn multi_avail_vertical_maintenance_scheduling() {
+        // Real-world scenario: schedule maintenance when mechanic, plane, and hangar
+        // are all free simultaneously.
+        let path = test_wal_path("multi_avail_maint.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let mechanic = Ulid::new();
+        engine.create_resource(mechanic, None, None, 1, None).await.unwrap();
+        // Mechanic: 7am-3pm Mon-Fri (we simulate one day)
+        engine.add_rule(Ulid::new(), mechanic, Span::new(7 * H, 15 * H), false).await.unwrap();
+        // Already doing another job 9am-11am
+        engine.confirm_booking(Ulid::new(), mechanic, Span::new(9 * H, 11 * H), None).await.unwrap();
+
+        let plane = Ulid::new();
+        engine.create_resource(plane, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), plane, Span::new(0, 24 * H), false).await.unwrap();
+        // Flying 6am-9am and 1pm-5pm
+        engine.confirm_booking(Ulid::new(), plane, Span::new(6 * H, 9 * H), None).await.unwrap();
+        engine.confirm_booking(Ulid::new(), plane, Span::new(13 * H, 17 * H), None).await.unwrap();
+
+        let hangar = Ulid::new();
+        engine.create_resource(hangar, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), hangar, Span::new(6 * H, 22 * H), false).await.unwrap();
+        // Another plane in hangar 7am-10am
+        engine.confirm_booking(Ulid::new(), hangar, Span::new(7 * H, 10 * H), None).await.unwrap();
+
+        // mechanic: [7,9) ∪ [11,15)
+        // plane: [0,6) ∪ [9,13) ∪ [17,24)
+        // hangar: [6,7) ∪ [10,22)
+        // ALL three free: [11,13) — the only maintenance window
+        let window = engine
+            .compute_multi_availability(&[mechanic, plane, hangar], 0, 24 * H, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(window, vec![Span::new(11 * H, 13 * H)]);
+
+        // Check it's long enough for a 2h maintenance job
+        let with_dur = engine
+            .compute_multi_availability(&[mechanic, plane, hangar], 0, 24 * H, 3, Some(2 * H))
+            .await
+            .unwrap();
+        assert_eq!(with_dur, vec![Span::new(11 * H, 13 * H)]);
+
+        // Not long enough for 3h job
+        let too_short = engine
+            .compute_multi_availability(&[mechanic, plane, hangar], 0, 24 * H, 3, Some(3 * H))
+            .await
+            .unwrap();
+        assert!(too_short.is_empty());
+    }
+
+    // ── Vertical: doctor + room + anesthesiologist ─────────────────
+
+    #[tokio::test]
+    async fn multi_avail_vertical_surgery_scheduling() {
+        let path = test_wal_path("multi_avail_surgery.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let doctor = Ulid::new();
+        engine.create_resource(doctor, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), doctor, Span::new(6 * H, 18 * H), false).await.unwrap();
+        // Rounds 6-8am, surgery 8-11am, appointments 2-5pm
+        engine.confirm_booking(Ulid::new(), doctor, Span::new(6 * H, 8 * H), None).await.unwrap();
+        engine.confirm_booking(Ulid::new(), doctor, Span::new(8 * H, 11 * H), None).await.unwrap();
+        engine.confirm_booking(Ulid::new(), doctor, Span::new(14 * H, 17 * H), None).await.unwrap();
+        // doctor free: [11,14) ∪ [17,18)
+
+        let or_room = Ulid::new();
+        engine.create_resource(or_room, None, None, 1, Some(30 * M)).await.unwrap(); // 30min cleaning buffer
+        engine.add_rule(Ulid::new(), or_room, Span::new(7 * H, 20 * H), false).await.unwrap();
+        // Surgery 7-10am (+ 30min cleaning = effective 10:30)
+        engine.confirm_booking(Ulid::new(), or_room, Span::new(7 * H, 10 * H), None).await.unwrap();
+        // or_room free: [10h30m, 20)
+
+        let anesthesiologist = Ulid::new();
+        engine.create_resource(anesthesiologist, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), anesthesiologist, Span::new(8 * H, 16 * H), false).await.unwrap();
+        // Busy 8-9am
+        engine.confirm_booking(Ulid::new(), anesthesiologist, Span::new(8 * H, 9 * H), None).await.unwrap();
+        // anesthesiologist free: [9,16)
+
+        // All three free:
+        // doctor: [11,14) [17,18)
+        // or_room: [10:30,20)
+        // anesthesiologist: [9,16)
+        // Intersection: [11,14)
+        let window = engine
+            .compute_multi_availability(&[doctor, or_room, anesthesiologist], 0, 24 * H, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(window, vec![Span::new(11 * H, 14 * H)]);
+    }
+
+    // ── Vertical: pool of interchangeable resources ───────────────
+
+    #[tokio::test]
+    async fn multi_avail_vertical_taxi_dispatch() {
+        // 4 taxis, dispatcher needs to know when at least 1 is available
+        let path = test_wal_path("multi_avail_taxi.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let mut taxis = Vec::new();
+        for _ in 0..4 {
+            let t = Ulid::new();
+            engine.create_resource(t, None, None, 1, None).await.unwrap();
+            engine.add_rule(Ulid::new(), t, Span::new(0, 24 * H), false).await.unwrap();
+            taxis.push(t);
+        }
+
+        // All taxis busy 8-9am (rush hour)
+        for &t in &taxis {
+            engine.confirm_booking(Ulid::new(), t, Span::new(8 * H, 9 * H), None).await.unwrap();
+        }
+
+        // Taxis 0,1 busy 12-1pm (lunch)
+        engine.confirm_booking(Ulid::new(), taxis[0], Span::new(12 * H, 13 * H), None).await.unwrap();
+        engine.confirm_booking(Ulid::new(), taxis[1], Span::new(12 * H, 13 * H), None).await.unwrap();
+
+        // min=1 (any taxi free): [0,8) ∪ [9,24) — 8-9am completely blocked
+        let any = engine
+            .compute_multi_availability(&taxis, 0, 24 * H, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(any, vec![Span::new(0, 8 * H), Span::new(9 * H, 24 * H)]);
+
+        // min=3: [0,8) ∪ [9,12) ∪ [13,24) — at lunch only 2 taxis (0,1 busy)
+        let three = engine
+            .compute_multi_availability(&taxis, 0, 24 * H, 3, None)
+            .await
+            .unwrap();
+        assert_eq!(three, vec![
+            Span::new(0, 8 * H),
+            Span::new(9 * H, 12 * H),
+            Span::new(13 * H, 24 * H),
+        ]);
+
+        // min=4 (all taxis): [0,8) ∪ [9,12) ∪ [13,24)
+        // Wait — taxis 2,3 are free at lunch, so at lunch count=2.
+        // For min=4 we also lose 12-1pm.
+        let all = engine
+            .compute_multi_availability(&taxis, 0, 24 * H, 4, None)
+            .await
+            .unwrap();
+        assert_eq!(all, vec![
+            Span::new(0, 8 * H),
+            Span::new(9 * H, 12 * H),
+            Span::new(13 * H, 24 * H),
+        ]);
+    }
+
+    // ── Query method tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_resources_returns_all() {
+        let path = test_wal_path("list_resources.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let a = Ulid::new();
+        let b = Ulid::new();
+        engine.create_resource(a, None, Some("Room A".into()), 2, Some(30 * M)).await.unwrap();
+        engine.create_resource(b, Some(a), Some("Seat B".into()), 1, None).await.unwrap();
+
+        let mut resources = engine.list_resources();
+        resources.sort_by_key(|r| r.id);
+
+        assert_eq!(resources.len(), 2);
+        let ra = resources.iter().find(|r| r.id == a).unwrap();
+        assert_eq!(ra.name, Some("Room A".into()));
+        assert_eq!(ra.capacity, 2);
+        assert_eq!(ra.buffer_after, Some(30 * M));
+        assert_eq!(ra.parent_id, None);
+
+        let rb = resources.iter().find(|r| r.id == b).unwrap();
+        assert_eq!(rb.name, Some("Seat B".into()));
+        assert_eq!(rb.parent_id, Some(a));
+    }
+
+    #[tokio::test]
+    async fn list_resources_empty() {
+        let path = test_wal_path("list_resources_empty.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        assert!(engine.list_resources().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_rules_for_resource() {
+        let path = test_wal_path("get_rules.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let r1 = Ulid::new();
+        let r2 = Ulid::new();
+        engine.add_rule(r1, rid, Span::new(9 * H, 17 * H), false).await.unwrap();
+        engine.add_rule(r2, rid, Span::new(12 * H, 13 * H), true).await.unwrap();
+
+        let rules = engine.get_rules(rid).await.unwrap();
+        assert_eq!(rules.len(), 2);
+
+        let nb = rules.iter().find(|r| r.id == r1).unwrap();
+        assert!(!nb.blocking);
+        assert_eq!(nb.start, 9 * H);
+        assert_eq!(nb.end, 17 * H);
+
+        let bl = rules.iter().find(|r| r.id == r2).unwrap();
+        assert!(bl.blocking);
+        assert_eq!(bl.start, 12 * H);
+    }
+
+    #[tokio::test]
+    async fn get_rules_not_found() {
+        let path = test_wal_path("get_rules_notfound.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        let rules = engine.get_rules(Ulid::new()).await.unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_bookings_for_resource() {
+        let path = test_wal_path("get_bookings.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let b1 = Ulid::new();
+        let b2 = Ulid::new();
+        engine.confirm_booking(b1, rid, Span::new(9 * H, 10 * H), Some("Alice".into())).await.unwrap();
+        engine.confirm_booking(b2, rid, Span::new(14 * H, 15 * H), None).await.unwrap();
+
+        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert_eq!(bookings.len(), 2);
+
+        let ba = bookings.iter().find(|b| b.id == b1).unwrap();
+        assert_eq!(ba.label, Some("Alice".into()));
+        assert_eq!(ba.start, 9 * H);
+
+        let bb = bookings.iter().find(|b| b.id == b2).unwrap();
+        assert_eq!(bb.label, None);
+    }
+
+    #[tokio::test]
+    async fn get_bookings_excludes_cancelled() {
+        let path = test_wal_path("get_bookings_cancel.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let bid = Ulid::new();
+        engine.confirm_booking(bid, rid, Span::new(9 * H, 10 * H), None).await.unwrap();
+        engine.cancel_booking(bid).await.unwrap();
+
+        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert!(bookings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_holds_for_resource() {
+        let path = test_wal_path("get_holds.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let far_future = now_ms() + 3_600_000;
+        let hid = Ulid::new();
+        engine.place_hold(hid, rid, Span::new(9 * H, 10 * H), far_future).await.unwrap();
+
+        let holds = engine.get_holds(rid).await.unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].id, hid);
+        assert_eq!(holds[0].expires_at, far_future);
+    }
+
+    // ── Update method tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_resource_changes_fields() {
+        let path = test_wal_path("update_resource.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, Some("Old Name".into()), 1, None).await.unwrap();
+
+        engine.update_resource(rid, Some("New Name".into()), 3, Some(15 * M)).await.unwrap();
+
+        let resources = engine.list_resources();
+        let r = resources.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(r.name, Some("New Name".into()));
+        assert_eq!(r.capacity, 3);
+        assert_eq!(r.buffer_after, Some(15 * M));
+    }
+
+    #[tokio::test]
+    async fn update_resource_not_found() {
+        let path = test_wal_path("update_resource_notfound.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        assert!(matches!(
+            engine.update_resource(Ulid::new(), None, 1, None).await,
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_resource_persists_via_wal() {
+        let path = test_wal_path("update_resource_wal.wal");
+        let notify = Arc::new(NotifyHub::new());
+
+        let rid = Ulid::new();
+        {
+            let engine = Engine::new(path.clone(), notify.clone()).unwrap();
+            engine.create_resource(rid, None, Some("Before".into()), 1, None).await.unwrap();
+            engine.update_resource(rid, Some("After".into()), 5, Some(H)).await.unwrap();
+        }
+
+        // Replay from WAL
+        let engine2 = Engine::new(path, notify).unwrap();
+        let resources = engine2.list_resources();
+        let r = resources.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(r.name, Some("After".into()));
+        assert_eq!(r.capacity, 5);
+        assert_eq!(r.buffer_after, Some(H));
+    }
+
+    #[tokio::test]
+    async fn update_rule_changes_span_and_blocking() {
+        let path = test_wal_path("update_rule.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let rule_id = Ulid::new();
+        engine.add_rule(rule_id, rid, Span::new(9 * H, 17 * H), false).await.unwrap();
+
+        // Update: narrow the window and make it blocking
+        engine.update_rule(rule_id, Span::new(10 * H, 16 * H), true).await.unwrap();
+
+        let rules = engine.get_rules(rid).await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, rule_id);
+        assert_eq!(rules[0].start, 10 * H);
+        assert_eq!(rules[0].end, 16 * H);
+        assert!(rules[0].blocking);
+    }
+
+    #[tokio::test]
+    async fn update_rule_not_found() {
+        let path = test_wal_path("update_rule_notfound.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+        assert!(matches!(
+            engine.update_rule(Ulid::new(), Span::new(0, 1000), false).await,
+            Err(EngineError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_rule_persists_via_wal() {
+        let path = test_wal_path("update_rule_wal.wal");
+        let notify = Arc::new(NotifyHub::new());
+
+        let rid = Ulid::new();
+        let rule_id = Ulid::new();
+        {
+            let engine = Engine::new(path.clone(), notify.clone()).unwrap();
+            engine.create_resource(rid, None, None, 1, None).await.unwrap();
+            engine.add_rule(rule_id, rid, Span::new(9 * H, 17 * H), false).await.unwrap();
+            engine.update_rule(rule_id, Span::new(8 * H, 20 * H), true).await.unwrap();
+        }
+
+        let engine2 = Engine::new(path, notify).unwrap();
+        let rules = engine2.get_rules(rid).await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].start, 8 * H);
+        assert_eq!(rules[0].end, 20 * H);
+        assert!(rules[0].blocking);
+    }
+
+    #[tokio::test]
+    async fn booking_label_preserved() {
+        let path = test_wal_path("booking_label.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+        let bid = Ulid::new();
+        engine.confirm_booking(bid, rid, Span::new(9 * H, 10 * H), Some("VIP Guest".into())).await.unwrap();
+
+        let bookings = engine.get_bookings(rid).await.unwrap();
+        assert_eq!(bookings[0].label, Some("VIP Guest".into()));
+    }
+
+    #[tokio::test]
+    async fn booking_label_persists_via_wal() {
+        let path = test_wal_path("booking_label_wal.wal");
+        let notify = Arc::new(NotifyHub::new());
+
+        let rid = Ulid::new();
+        let bid = Ulid::new();
+        {
+            let engine = Engine::new(path.clone(), notify.clone()).unwrap();
+            engine.create_resource(rid, None, None, 1, None).await.unwrap();
+            engine.confirm_booking(bid, rid, Span::new(9 * H, 10 * H), Some("Replay Test".into())).await.unwrap();
+        }
+
+        let engine2 = Engine::new(path, notify).unwrap();
+        let bookings = engine2.get_bookings(rid).await.unwrap();
+        assert_eq!(bookings.len(), 1);
+        assert_eq!(bookings[0].label, Some("Replay Test".into()));
+    }
+
+    #[tokio::test]
+    async fn resource_name_preserved_after_create() {
+        let path = test_wal_path("resource_name.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, Some("Theater".into()), 1, None).await.unwrap();
+
+        let resources = engine.list_resources();
+        assert_eq!(resources[0].name, Some("Theater".into()));
+    }
+
+    #[tokio::test]
+    async fn resource_name_persists_via_wal() {
+        let path = test_wal_path("resource_name_wal.wal");
+        let notify = Arc::new(NotifyHub::new());
+
+        let rid = Ulid::new();
+        {
+            let engine = Engine::new(path.clone(), notify.clone()).unwrap();
+            engine.create_resource(rid, None, Some("Stadium".into()), 50, None).await.unwrap();
+        }
+
+        let engine2 = Engine::new(path, notify).unwrap();
+        let resources = engine2.list_resources();
+        let r = resources.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(r.name, Some("Stadium".into()));
+        assert_eq!(r.capacity, 50);
+    }
+
+    // ── WAL compaction tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn compact_wal_preserves_state() {
+        let path = test_wal_path("compact_state.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path.clone(), notify.clone()).unwrap();
+
+        // Build state with churn: create resources, add/remove rules, book/cancel
+        let parent = Ulid::new();
+        engine.create_resource(parent, None, Some("Building".into()), 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), parent, Span::new(0, 24 * H), false).await.unwrap();
+
+        let child = Ulid::new();
+        engine.create_resource(child, Some(parent), Some("Room A".into()), 3, Some(30 * M)).await.unwrap();
+
+        // Add and remove some rules (churn)
+        let temp_rule = Ulid::new();
+        engine.add_rule(temp_rule, child, Span::new(0, 1000), false).await.unwrap();
+        engine.remove_rule(temp_rule).await.unwrap();
+
+        // Add a permanent rule
+        let perm_rule = Ulid::new();
+        engine.add_rule(perm_rule, child, Span::new(9 * H, 17 * H), false).await.unwrap();
+
+        // Book and cancel (churn)
+        let temp_booking = Ulid::new();
+        engine.confirm_booking(temp_booking, child, Span::new(9 * H, 10 * H), None).await.unwrap();
+        engine.cancel_booking(temp_booking).await.unwrap();
+
+        // Permanent booking
+        let perm_booking = Ulid::new();
+        engine.confirm_booking(perm_booking, child, Span::new(14 * H, 15 * H), Some("Team Meeting".into())).await.unwrap();
+
+        // Snapshot pre-compact state
+        let resources_before = engine.list_resources();
+        let rules_before = engine.get_rules(child).await.unwrap();
+        let bookings_before = engine.get_bookings(child).await.unwrap();
+        let avail_before = engine.compute_availability(child, 0, 24 * H, None).await.unwrap();
+
+        // Get WAL size before compaction
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        // Compact
+        engine.compact_wal().await.unwrap();
+
+        // WAL should be smaller (removed churn)
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(size_after < size_before, "compacted WAL ({size_after}) should be smaller than original ({size_before})");
+
+        // State should be identical
+        let resources_after = engine.list_resources();
+        assert_eq!(resources_before.len(), resources_after.len());
+
+        let rules_after = engine.get_rules(child).await.unwrap();
+        assert_eq!(rules_before.len(), rules_after.len());
+        assert_eq!(rules_after[0].id, perm_rule);
+
+        let bookings_after = engine.get_bookings(child).await.unwrap();
+        assert_eq!(bookings_before.len(), bookings_after.len());
+        assert_eq!(bookings_after[0].label, Some("Team Meeting".into()));
+
+        let avail_after = engine.compute_availability(child, 0, 24 * H, None).await.unwrap();
+        assert_eq!(avail_before, avail_after);
+    }
+
+    #[tokio::test]
+    async fn compact_wal_survives_restart() {
+        let path = test_wal_path("compact_restart.wal");
+        let notify = Arc::new(NotifyHub::new());
+
+        let parent = Ulid::new();
+        let child = Ulid::new();
+        let booking_id = Ulid::new();
+        let rule_id = Ulid::new();
+
+        {
+            let engine = Engine::new(path.clone(), notify.clone()).unwrap();
+            engine.create_resource(parent, None, Some("Gym".into()), 1, None).await.unwrap();
+            engine.add_rule(Ulid::new(), parent, Span::new(0, 24 * H), false).await.unwrap();
+            engine.create_resource(child, Some(parent), Some("Treadmill 1".into()), 1, Some(10 * M)).await.unwrap();
+            engine.add_rule(rule_id, child, Span::new(6 * H, 22 * H), false).await.unwrap();
+            engine.confirm_booking(booking_id, child, Span::new(9 * H, 10 * H), Some("Alice".into())).await.unwrap();
+
+            // Create churn
+            for _ in 0..20 {
+                let tmp = Ulid::new();
+                engine.add_rule(tmp, child, Span::new(0, 100), false).await.unwrap();
+                engine.remove_rule(tmp).await.unwrap();
+            }
+
+            // Compact
+            engine.compact_wal().await.unwrap();
+
+            // Append new event AFTER compaction
+            engine.add_rule(Ulid::new(), child, Span::new(12 * H, 13 * H), true).await.unwrap();
+        }
+
+        // Restart from compacted WAL
+        let engine2 = Engine::new(path, notify).unwrap();
+
+        let resources = engine2.list_resources();
+        assert_eq!(resources.len(), 2);
+        let gym = resources.iter().find(|r| r.id == parent).unwrap();
+        assert_eq!(gym.name, Some("Gym".into()));
+
+        let treadmill = resources.iter().find(|r| r.id == child).unwrap();
+        assert_eq!(treadmill.name, Some("Treadmill 1".into()));
+        assert_eq!(treadmill.buffer_after, Some(10 * M));
+        assert_eq!(treadmill.parent_id, Some(parent));
+
+        let rules = engine2.get_rules(child).await.unwrap();
+        assert_eq!(rules.len(), 2); // non-blocking + post-compact blocking
+
+        let bookings = engine2.get_bookings(child).await.unwrap();
+        assert_eq!(bookings.len(), 1);
+        assert_eq!(bookings[0].id, booking_id);
+        assert_eq!(bookings[0].label, Some("Alice".into()));
+    }
+
+    // ── Group-commit WAL tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn group_commit_batches_appends() {
+        let path = test_wal_path("group_commit_batch.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Arc::new(Engine::new(path.clone(), notify.clone()).unwrap());
+
+        let n = 20;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let eng = engine.clone();
+            handles.push(tokio::spawn(async move {
+                eng.create_resource(Ulid::new(), None, Some(format!("R{i}")), 1, None)
+                    .await
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        assert_eq!(engine.list_resources().len(), n);
+
+        // Replay WAL from disk — should reconstruct the same N resources
+        let engine2 = Engine::new(path, notify).unwrap();
+        assert_eq!(engine2.list_resources().len(), n);
+    }
+
+    #[tokio::test]
+    async fn wal_appends_since_compact_through_channel() {
+        let path = test_wal_path("appends_counter.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        assert_eq!(engine.wal_appends_since_compact().await, 0);
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        let rule_id = Ulid::new();
+        engine.add_rule(rule_id, rid, Span::new(0, 1000), false).await.unwrap();
+        engine.remove_rule(rule_id).await.unwrap();
+
+        assert_eq!(engine.wal_appends_since_compact().await, 3);
+    }
+
+    #[tokio::test]
+    async fn compact_resets_append_counter() {
+        let path = test_wal_path("compact_counter.wal");
+        let notify = Arc::new(NotifyHub::new());
+        let engine = Engine::new(path, notify).unwrap();
+
+        let rid = Ulid::new();
+        engine.create_resource(rid, None, None, 1, None).await.unwrap();
+        engine.add_rule(Ulid::new(), rid, Span::new(0, 1000), false).await.unwrap();
+        assert!(engine.wal_appends_since_compact().await > 0);
+
+        engine.compact_wal().await.unwrap();
+        assert_eq!(engine.wal_appends_since_compact().await, 0);
     }
 }
