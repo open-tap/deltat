@@ -92,13 +92,24 @@ pub enum Command {
     Listen {
         channel: String,
     },
+    Unlisten {
+        channel: String,
+    },
+    UnlistenAll,
 }
 
 pub fn parse_sql(sql: &str) -> Result<Command, SqlError> {
     let trimmed = sql.trim();
     if trimmed.to_uppercase().starts_with("LISTEN ") {
-        let channel = trimmed[7..].trim().trim_matches(';').to_string();
+        let channel = trimmed[7..].trim().trim_matches(';').trim_matches('"').to_string();
         return Ok(Command::Listen { channel });
+    }
+    if trimmed.to_uppercase().starts_with("UNLISTEN ") {
+        let rest = trimmed[9..].trim().trim_matches(';').trim_matches('"');
+        if rest == "*" {
+            return Ok(Command::UnlistenAll);
+        }
+        return Ok(Command::Unlisten { channel: rest.to_string() });
     }
 
     let dialect = PostgreSqlDialect {};
@@ -132,7 +143,7 @@ fn parse_insert(insert: &ast::Insert) -> Result<Command, SqlError> {
             };
 
             let id = parse_ulid(&values[col_idx("id").unwrap_or(0)])?;
-            let parent_id = col_idx("parent_id").or(if values.len() >= 2 { Some(1) } else { None })
+            let parent_id = col_idx("parent_id").or(if columns.is_empty() && values.len() >= 2 { Some(1) } else { None })
                 .map(|i| parse_ulid_or_null(&values[i]))
                 .transpose()?
                 .flatten();
@@ -1358,6 +1369,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_unlisten() {
+        let sql = "UNLISTEN resource_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let cmd = parse_sql(sql).unwrap();
+        match cmd {
+            Command::Unlisten { channel } => {
+                assert_eq!(channel, "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            }
+            _ => panic!("expected Unlisten, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlisten_all() {
+        let sql = "UNLISTEN *";
+        let cmd = parse_sql(sql).unwrap();
+        assert!(matches!(cmd, Command::UnlistenAll));
+    }
+
+    #[test]
+    fn parse_unlisten_with_semicolon() {
+        let sql = "UNLISTEN resource_01ARZ3NDEKTSV4RRFFQ69G5FAV;";
+        let cmd = parse_sql(sql).unwrap();
+        match cmd {
+            Command::Unlisten { channel } => {
+                assert_eq!(channel, "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            }
+            _ => panic!("expected Unlisten, got {cmd:?}"),
+        }
+    }
+
+    #[test]
     fn in_clause_at_limit() {
         let ids: Vec<String> = (0..MAX_IN_CLAUSE_IDS)
             .map(|_| format!("'{}'", ulid::Ulid::new()))
@@ -1368,5 +1410,61 @@ mod tests {
         );
         let result = parse_sql(&sql);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_listen_case_insensitive() {
+        let sql = "listen resource_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let cmd = parse_sql(sql).unwrap();
+        match cmd {
+            Command::Listen { channel } => {
+                assert_eq!(channel, "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            }
+            _ => panic!("expected Listen, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_with_semicolon() {
+        let sql = "LISTEN resource_01ARZ3NDEKTSV4RRFFQ69G5FAV;";
+        let cmd = parse_sql(sql).unwrap();
+        match cmd {
+            Command::Listen { channel } => {
+                assert_eq!(channel, "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            }
+            _ => panic!("expected Listen, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlisten_all_with_semicolon() {
+        let sql = "UNLISTEN *;";
+        let cmd = parse_sql(sql).unwrap();
+        assert!(matches!(cmd, Command::UnlistenAll));
+    }
+
+    #[test]
+    fn parse_listen_quoted_channel() {
+        // postgres.js sends LISTEN "channel_name" with double quotes
+        let sql = r#"LISTEN "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV""#;
+        let cmd = parse_sql(sql).unwrap();
+        match cmd {
+            Command::Listen { channel } => {
+                assert_eq!(channel, "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            }
+            _ => panic!("expected Listen, got {cmd:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unlisten_quoted_channel() {
+        let sql = r#"UNLISTEN "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV""#;
+        let cmd = parse_sql(sql).unwrap();
+        match cmd {
+            Command::Unlisten { channel } => {
+                assert_eq!(channel, "resource_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            }
+            _ => panic!("expected Unlisten, got {cmd:?}"),
+        }
     }
 }

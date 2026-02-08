@@ -12,3 +12,4 @@ pub const MAX_NAME_LEN: usize = 1_000;
 pub const MAX_LABEL_LEN: usize = 10_000;
 pub const MAX_TENANT_NAME_LEN: usize = 256;
 pub const MAX_QUERY_LEN: usize = 1_048_576; // 1MB
+pub const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 100;

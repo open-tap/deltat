@@ -1,0 +1,15 @@
+{
+  "name": "@deltat/client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "postgres": "^3.4.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.8"
+  }
+}

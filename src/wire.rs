@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream;
-use futures::Sink;
+use futures::{Sink, SinkExt, StreamExt};
 use pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
-use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
-use pgwire::api::copy::CopyHandler;
+use pgwire::api::auth::DefaultServerParameterProvider;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -15,28 +16,55 @@ use pgwire::api::results::{
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::response::NotificationResponse;
 use pgwire::messages::PgWireBackendMessage;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::codec::Framed;
 use ulid::Ulid;
 
 use crate::auth::DeltaTAuthSource;
 use crate::engine::Engine;
-use crate::limits::MAX_QUERY_LEN;
+use crate::limits::{MAX_QUERY_LEN, MAX_SUBSCRIPTIONS_PER_CONNECTION};
 use crate::model::*;
 use crate::sql::{self, Command};
 use crate::tenant::TenantManager;
 
+// ── Subscription plumbing ────────────────────────────────────────
+
+pub enum SubscriptionCommand {
+    Subscribe(Ulid),
+    Unsubscribe(Ulid),
+    UnsubscribeAll,
+}
+
 pub struct DeltaTHandler {
     tenant_manager: Arc<TenantManager>,
     query_parser: Arc<DeltaTQueryParser>,
+    subscribe_tx: Option<mpsc::UnboundedSender<SubscriptionCommand>>,
 }
 
 impl DeltaTHandler {
+    #[allow(dead_code)]
     pub fn new(tenant_manager: Arc<TenantManager>) -> Self {
         Self {
             tenant_manager,
             query_parser: Arc::new(DeltaTQueryParser),
+            subscribe_tx: None,
+        }
+    }
+
+    pub fn with_subscriptions(
+        tenant_manager: Arc<TenantManager>,
+        subscribe_tx: mpsc::UnboundedSender<SubscriptionCommand>,
+    ) -> Self {
+        Self {
+            tenant_manager,
+            query_parser: Arc::new(DeltaTQueryParser),
+            subscribe_tx: Some(subscribe_tx),
         }
     }
 
@@ -51,6 +79,23 @@ impl DeltaTHandler {
                 "ERROR".into(),
                 "08006".into(),
                 format!("tenant error: {e}"),
+            )))
+        })
+    }
+
+    fn parse_channel_resource_id(channel: &str) -> PgWireResult<Ulid> {
+        let resource_id_str = channel.strip_prefix("resource_").ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42000".into(),
+                format!("invalid channel: {channel} (expected resource_{{id}})"),
+            )))
+        })?;
+        Ulid::from_string(resource_id_str).map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42000".into(),
+                format!("bad ULID in channel: {e}"),
             )))
         })
     }
@@ -289,21 +334,24 @@ impl DeltaTHandler {
                 Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
             }
             Command::Listen { channel } => {
-                let resource_id_str = channel.strip_prefix("resource_").ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "42000".into(),
-                        format!("invalid channel: {channel} (expected resource_{{id}})"),
-                    )))
-                })?;
-                let _resource_id = Ulid::from_string(resource_id_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "42000".into(),
-                        format!("bad ULID in channel: {e}"),
-                    )))
-                })?;
+                let resource_id = Self::parse_channel_resource_id(&channel)?;
+                if let Some(ref tx) = self.subscribe_tx {
+                    let _ = tx.send(SubscriptionCommand::Subscribe(resource_id));
+                }
                 Ok(vec![Response::Execution(Tag::new("LISTEN"))])
+            }
+            Command::Unlisten { channel } => {
+                let resource_id = Self::parse_channel_resource_id(&channel)?;
+                if let Some(ref tx) = self.subscribe_tx {
+                    let _ = tx.send(SubscriptionCommand::Unsubscribe(resource_id));
+                }
+                Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
+            }
+            Command::UnlistenAll => {
+                if let Some(ref tx) = self.subscribe_tx {
+                    let _ = tx.send(SubscriptionCommand::UnsubscribeAll);
+                }
+                Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
             }
         }
     }
@@ -541,46 +589,179 @@ fn substitute_params(portal: &Portal<String>) -> String {
     result
 }
 
-// ── Factory ──────────────────────────────────────────────────────
+// ── Custom connection loop with LISTEN/NOTIFY ────────────────────
 
-pub struct DeltaTFactory {
-    handler: Arc<DeltaTHandler>,
-    auth_handler:
-        Arc<CleartextPasswordAuthStartupHandler<DeltaTAuthSource, DefaultServerParameterProvider>>,
-    noop: Arc<NoopHandler>,
-}
+pub async fn process_connection(
+    tcp_socket: TcpStream,
+    tenant_manager: Arc<TenantManager>,
+    password: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Negotiate TLS (no TLS acceptor for now)
+    let mut socket: Framed<
+        pgwire::tokio::server::MaybeTls,
+        pgwire::tokio::server::PgWireMessageServerCodec<String>,
+    > = match pgwire::tokio::server::negotiate_tls::<String>(tcp_socket, None).await? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
 
-impl DeltaTFactory {
-    pub fn new(tenant_manager: Arc<TenantManager>, password: String) -> Self {
-        let auth_source = DeltaTAuthSource::new(password);
-        let param_provider = DefaultServerParameterProvider::default();
-        Self {
-            handler: Arc::new(DeltaTHandler::new(tenant_manager)),
-            auth_handler: Arc::new(CleartextPasswordAuthStartupHandler::new(
-                auth_source,
-                param_provider,
-            )),
-            noop: Arc::new(NoopHandler),
+    // 2. Per-connection channels
+    let (subscribe_tx, mut subscribe_rx) = mpsc::unbounded_channel::<SubscriptionCommand>();
+    let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<NotificationResponse>();
+
+    // 3. Per-connection handlers
+    let auth_handler = Arc::new(CleartextPasswordAuthStartupHandler::new(
+        DeltaTAuthSource::new(password),
+        DefaultServerParameterProvider::default(),
+    ));
+    let handler = Arc::new(DeltaTHandler::with_subscriptions(
+        tenant_manager.clone(),
+        subscribe_tx,
+    ));
+    let noop = Arc::new(NoopHandler);
+
+    // 4. Forwarder tasks state
+    let mut forwarders: HashMap<Ulid, JoinHandle<()>> = HashMap::new();
+    let startup_deadline = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(startup_deadline);
+
+    // 5. Main loop
+    loop {
+        let in_startup = matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        );
+
+        if in_startup {
+            let msg = tokio::select! {
+                _ = &mut startup_deadline => break,
+                msg = socket.next() => msg,
+            };
+            match msg {
+                Some(Ok(msg)) => {
+                    if let Err(e) = pgwire::tokio::server::process_message(
+                        msg,
+                        &mut socket,
+                        auth_handler.clone(),
+                        handler.clone(),
+                        handler.clone(),
+                        noop.clone(),
+                        noop.clone(),
+                    )
+                    .await
+                    {
+                        tracing::debug!("startup error: {e}");
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        } else {
+            enum Action<M, E> {
+                Message(Option<Result<M, E>>),
+                Subscribe(Option<SubscriptionCommand>),
+                Notify(Option<NotificationResponse>),
+            }
+
+            let action = tokio::select! {
+                msg = socket.next() => Action::Message(msg),
+                cmd = subscribe_rx.recv() => Action::Subscribe(cmd),
+                notif = notify_rx.recv() => Action::Notify(notif),
+            };
+
+            match action {
+                Action::Message(Some(Ok(msg))) => {
+                    let is_extended = match socket.state() {
+                        PgWireConnectionState::CopyInProgress(ext) => ext,
+                        _ => msg.is_extended_query(),
+                    };
+                    if let Err(e) = pgwire::tokio::server::process_message(
+                        msg,
+                        &mut socket,
+                        auth_handler.clone(),
+                        handler.clone(),
+                        handler.clone(),
+                        noop.clone(),
+                        noop.clone(),
+                    )
+                    .await
+                    {
+                        if pgwire::tokio::server::process_error(
+                            &mut socket,
+                            e,
+                            is_extended,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Action::Message(_) => break,
+                Action::Subscribe(Some(cmd)) => {
+                    match cmd {
+                        SubscriptionCommand::Subscribe(rid) => {
+                            if forwarders.contains_key(&rid) {
+                                continue; // already subscribed
+                            }
+                            if forwarders.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                                continue; // limit reached
+                            }
+                            // Resolve the engine to get the notify hub
+                            let engine = match handler.resolve_engine(&socket) {
+                                Ok(e) => e,
+                                Err(_) => continue,
+                            };
+                            let mut rx = engine.notify.subscribe(rid);
+                            let tx = notify_tx.clone();
+                            let channel = format!("resource_{rid}");
+                            forwarders.insert(
+                                rid,
+                                tokio::spawn(async move {
+                                    while let Ok(event) = rx.recv().await {
+                                        let payload =
+                                            serde_json::to_string(&event).unwrap_or_default();
+                                        let notif =
+                                            NotificationResponse::new(0, channel.clone(), payload);
+                                        if tx.send(notif).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }),
+                            );
+                        }
+                        SubscriptionCommand::Unsubscribe(rid) => {
+                            if let Some(handle) = forwarders.remove(&rid) {
+                                handle.abort();
+                            }
+                        }
+                        SubscriptionCommand::UnsubscribeAll => {
+                            for (_, handle) in forwarders.drain() {
+                                handle.abort();
+                            }
+                        }
+                    }
+                }
+                Action::Subscribe(None) => {}
+                Action::Notify(Some(notif)) => {
+                    let msg: PgWireBackendMessage =
+                        PgWireBackendMessage::NotificationResponse(notif);
+                    if SinkExt::send(&mut socket, msg).await.is_err() {
+                        break;
+                    }
+                }
+                Action::Notify(None) => {}
+            }
         }
     }
-}
 
-impl PgWireServerHandlers for DeltaTFactory {
-    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        self.handler.clone()
+    // Cleanup: abort all forwarder tasks
+    for (_, handle) in forwarders {
+        handle.abort();
     }
-
-    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        self.handler.clone()
-    }
-
-    fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.auth_handler.clone()
-    }
-
-    fn copy_handler(&self) -> Arc<impl CopyHandler> {
-        self.noop.clone()
-    }
+    Ok(())
 }
 
 fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
@@ -792,5 +973,142 @@ mod tests {
         assert!(result.contains("'1000'"));
         assert!(result.contains("'2000'"));
         assert!(result.contains("'false'"));
+    }
+
+    // ── parse_channel_resource_id ───────────────────────────────
+
+    #[test]
+    fn parse_channel_valid() {
+        let ulid = Ulid::new();
+        let channel = format!("resource_{ulid}");
+        let result = DeltaTHandler::parse_channel_resource_id(&channel).unwrap();
+        assert_eq!(result, ulid);
+    }
+
+    #[test]
+    fn parse_channel_missing_prefix() {
+        let result = DeltaTHandler::parse_channel_resource_id("foobar_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("invalid channel"));
+    }
+
+    #[test]
+    fn parse_channel_bad_ulid() {
+        let result = DeltaTHandler::parse_channel_resource_id("resource_notaulid");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("bad ULID"));
+    }
+
+    #[test]
+    fn parse_channel_empty_after_prefix() {
+        let result = DeltaTHandler::parse_channel_resource_id("resource_");
+        assert!(result.is_err());
+    }
+
+    // ── execute_command: Listen / Unlisten / UnlistenAll ─────────
+
+    use crate::notify::NotifyHub;
+    use std::path::PathBuf;
+
+    fn test_wal_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("deltat_test_wire");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn setup_handler_with_subs() -> (
+        DeltaTHandler,
+        mpsc::UnboundedReceiver<SubscriptionCommand>,
+        Arc<Engine>,
+    ) {
+        let notify = Arc::new(NotifyHub::new());
+        let path = test_wal_path(&format!("wire_{}.wal", Ulid::new()));
+        let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+        let tm = Arc::new(TenantManager::new(
+            std::env::temp_dir().join("deltat_test_wire_tm"),
+            1000,
+        ));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let handler = DeltaTHandler::with_subscriptions(tm, tx);
+        (handler, rx, engine)
+    }
+
+    #[tokio::test]
+    async fn execute_listen_sends_subscribe() {
+        let (handler, mut rx, engine) = setup_handler_with_subs();
+        let rid = Ulid::new();
+        let channel = format!("resource_{rid}");
+        let cmd = Command::Listen { channel };
+        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        assert_eq!(responses.len(), 1);
+
+        let sub_cmd = rx.try_recv().unwrap();
+        match sub_cmd {
+            SubscriptionCommand::Subscribe(id) => assert_eq!(id, rid),
+            _ => panic!("expected Subscribe"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_listen_invalid_channel() {
+        let (handler, _rx, engine) = setup_handler_with_subs();
+        let cmd = Command::Listen {
+            channel: "bad_channel".into(),
+        };
+        let result = handler.execute_command(&engine, cmd).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_listen_without_subscribe_tx() {
+        let tm = Arc::new(TenantManager::new(
+            std::env::temp_dir().join("deltat_test_wire_no_sub"),
+            1000,
+        ));
+        let handler = DeltaTHandler::new(tm);
+
+        let notify = Arc::new(NotifyHub::new());
+        let path = test_wal_path(&format!("wire_nosub_{}.wal", Ulid::new()));
+        let engine = Arc::new(Engine::new(path, notify).unwrap());
+
+        let rid = Ulid::new();
+        let channel = format!("resource_{rid}");
+        let cmd = Command::Listen { channel };
+        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        assert_eq!(responses.len(), 1);
+        // No subscribe_tx, so no command sent — just returns LISTEN tag
+    }
+
+    #[tokio::test]
+    async fn execute_unlisten_sends_unsubscribe() {
+        let (handler, mut rx, engine) = setup_handler_with_subs();
+        let rid = Ulid::new();
+        let channel = format!("resource_{rid}");
+        let cmd = Command::Unlisten { channel };
+        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        assert_eq!(responses.len(), 1);
+
+        let sub_cmd = rx.try_recv().unwrap();
+        match sub_cmd {
+            SubscriptionCommand::Unsubscribe(id) => assert_eq!(id, rid),
+            _ => panic!("expected Unsubscribe"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_unlisten_all_sends_command() {
+        let (handler, mut rx, engine) = setup_handler_with_subs();
+        let cmd = Command::UnlistenAll;
+        let responses = handler.execute_command(&engine, cmd).await.unwrap();
+        assert_eq!(responses.len(), 1);
+
+        let sub_cmd = rx.try_recv().unwrap();
+        assert!(matches!(sub_cmd, SubscriptionCommand::UnsubscribeAll));
     }
 }

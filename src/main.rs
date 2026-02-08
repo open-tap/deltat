@@ -1,14 +1,3 @@
-mod auth;
-mod engine;
-mod limits;
-mod model;
-mod notify;
-mod reaper;
-mod sql;
-mod tenant;
-mod wal;
-mod wire;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,8 +5,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::info;
 
-use crate::tenant::TenantManager;
-use crate::wire::DeltaTFactory;
+use deltat::tenant::TenantManager;
+use deltat::wire;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -89,16 +78,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 info!("connection from {peer}");
-                let factory = Arc::new(DeltaTFactory::new(
-                    tenant_manager.clone(),
-                    password.clone(),
-                ));
+                let tm = tenant_manager.clone();
+                let pw = password.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit; // held until connection closes
-                    match pgwire::tokio::process_socket(socket, None, factory).await {
-                        Ok(_) => {}
-                        Err(e) => tracing::error!("connection error from {peer}: {e}"),
+                    if let Err(e) = wire::process_connection(socket, tm, pw).await {
+                        tracing::error!("connection error from {peer}: {e}");
                     }
                 });
             }
