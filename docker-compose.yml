@@ -1,0 +1,13 @@
+services:
+  deltat:
+    build: .
+    ports:
+      - "5433:5433"
+    volumes:
+      - deltat-data:/data
+    environment:
+      - DELTAT_PASSWORD=deltat
+    restart: unless-stopped
+
+volumes:
+  deltat-data:

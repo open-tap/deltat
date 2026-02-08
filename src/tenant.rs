@@ -12,13 +12,15 @@ use crate::reaper;
 pub struct TenantManager {
     engines: DashMap<String, Arc<Engine>>,
     data_dir: PathBuf,
+    compact_threshold: u64,
 }
 
 impl TenantManager {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, compact_threshold: u64) -> Self {
         Self {
             engines: DashMap::new(),
             data_dir,
+            compact_threshold,
         }
     }
 
@@ -44,10 +46,15 @@ impl TenantManager {
         let notify = Arc::new(NotifyHub::new());
         let engine = Arc::new(Engine::new(wal_path, notify)?);
 
-        // Spawn reaper for this tenant
+        // Spawn reaper + compactor for this tenant
         let reaper_engine = engine.clone();
         tokio::spawn(async move {
             reaper::run_reaper(reaper_engine).await;
+        });
+        let compactor_engine = engine.clone();
+        let threshold = self.compact_threshold;
+        tokio::spawn(async move {
+            reaper::run_compactor(compactor_engine, threshold).await;
         });
 
         self.engines.insert(tenant.to_string(), engine.clone());
@@ -72,7 +79,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_isolation() {
         let dir = test_data_dir("isolation");
-        let tm = TenantManager::new(dir);
+        let tm = TenantManager::new(dir, 1000);
 
         let eng_a = tm.get_or_create("tenant_a").unwrap();
         let eng_b = tm.get_or_create("tenant_b").unwrap();
@@ -80,8 +87,8 @@ mod tests {
         let rid = Ulid::new();
 
         // Create same resource ID in both tenants
-        eng_a.create_resource(rid, None, 1, None).await.unwrap();
-        eng_b.create_resource(rid, None, 1, None).await.unwrap();
+        eng_a.create_resource(rid, None, None, 1, None).await.unwrap();
+        eng_b.create_resource(rid, None, None, 1, None).await.unwrap();
 
         // Add rule in tenant A
         eng_a
@@ -101,7 +108,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_lazy_creation() {
         let dir = test_data_dir("lazy");
-        let tm = TenantManager::new(dir.clone());
+        let tm = TenantManager::new(dir.clone(), 1000);
 
         // No WAL files should exist yet
         let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
@@ -117,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_same_engine_returned() {
         let dir = test_data_dir("same_eng");
-        let tm = TenantManager::new(dir);
+        let tm = TenantManager::new(dir, 1000);
 
         let eng1 = tm.get_or_create("foo").unwrap();
         let eng2 = tm.get_or_create("foo").unwrap();
@@ -129,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_name_sanitized() {
         let dir = test_data_dir("sanitize");
-        let tm = TenantManager::new(dir.clone());
+        let tm = TenantManager::new(dir.clone(), 1000);
 
         // Path traversal attempt
         let _eng = tm.get_or_create("../evil").unwrap();

@@ -46,8 +46,8 @@ pub enum IntervalKind {
     Blocking,
     /// Temporary reservation with expiration.
     Hold { expires_at: Ms },
-    /// Permanent reservation.
-    Booking,
+    /// Permanent reservation with optional label.
+    Booking { label: Option<String> },
 }
 
 /// A single interval on a resource — rules, holds, and bookings are all just intervals.
@@ -66,7 +66,7 @@ impl Interval {
 
     #[allow(dead_code)]
     pub fn is_allocation(&self) -> bool {
-        matches!(self.kind, IntervalKind::Hold { .. } | IntervalKind::Booking)
+        matches!(self.kind, IntervalKind::Hold { .. } | IntervalKind::Booking { .. })
     }
 }
 
@@ -74,6 +74,7 @@ impl Interval {
 pub struct ResourceState {
     pub id: Ulid,
     pub parent_id: Option<Ulid>,
+    pub name: Option<String>,
     /// Max concurrent allocations (default 1).
     pub capacity: u32,
     /// Buffer time in ms after each allocation ends (e.g. cleaning time).
@@ -83,10 +84,11 @@ pub struct ResourceState {
 }
 
 impl ResourceState {
-    pub fn new(id: Ulid, parent_id: Option<Ulid>, capacity: u32, buffer_after: Option<Ms>) -> Self {
+    pub fn new(id: Ulid, parent_id: Option<Ulid>, name: Option<String>, capacity: u32, buffer_after: Option<Ms>) -> Self {
         Self {
             id,
             parent_id,
+            name,
             capacity,
             buffer_after,
             intervals: Vec::new(),
@@ -124,12 +126,19 @@ impl ResourceState {
     }
 }
 
-/// The 8 event types — flat, no nesting. This is the WAL record format.
+/// The event types — flat, no nesting. This is the WAL record format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     ResourceCreated {
         id: Ulid,
         parent_id: Option<Ulid>,
+        name: Option<String>,
+        capacity: u32,
+        buffer_after: Option<Ms>,
+    },
+    ResourceUpdated {
+        id: Ulid,
+        name: Option<String>,
         capacity: u32,
         buffer_after: Option<Ms>,
     },
@@ -137,6 +146,12 @@ pub enum Event {
         id: Ulid,
     },
     RuleAdded {
+        id: Ulid,
+        resource_id: Ulid,
+        span: Span,
+        blocking: bool,
+    },
+    RuleUpdated {
         id: Ulid,
         resource_id: Ulid,
         span: Span,
@@ -160,11 +175,50 @@ pub enum Event {
         id: Ulid,
         resource_id: Ulid,
         span: Span,
+        label: Option<String>,
     },
     BookingCancelled {
         id: Ulid,
         resource_id: Ulid,
     },
+}
+
+// ── Query result types ───────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceInfo {
+    pub id: Ulid,
+    pub parent_id: Option<Ulid>,
+    pub name: Option<String>,
+    pub capacity: u32,
+    pub buffer_after: Option<Ms>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleInfo {
+    pub id: Ulid,
+    pub resource_id: Ulid,
+    pub start: Ms,
+    pub end: Ms,
+    pub blocking: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookingInfo {
+    pub id: Ulid,
+    pub resource_id: Ulid,
+    pub start: Ms,
+    pub end: Ms,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldInfo {
+    pub id: Ulid,
+    pub resource_id: Ulid,
+    pub start: Ms,
+    pub end: Ms,
+    pub expires_at: Ms,
 }
 
 #[cfg(test)]
@@ -201,11 +255,11 @@ mod tests {
 
     #[test]
     fn interval_ordering() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         rs.insert_interval(Interval {
             id: Ulid::new(),
             span: Span::new(300, 400),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
         rs.insert_interval(Interval {
             id: Ulid::new(),
@@ -224,12 +278,12 @@ mod tests {
 
     #[test]
     fn interval_remove() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         let id = Ulid::new();
         rs.insert_interval(Interval {
             id,
             span: Span::new(100, 200),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
         assert_eq!(rs.intervals.len(), 1);
         rs.remove_interval(id);
@@ -238,12 +292,12 @@ mod tests {
 
     #[test]
     fn overlapping_skips_past() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         // Past interval
         rs.insert_interval(Interval {
             id: Ulid::new(),
             span: Span::new(100, 200),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
         // Overlapping interval
         rs.insert_interval(Interval {
@@ -255,7 +309,7 @@ mod tests {
         rs.insert_interval(Interval {
             id: Ulid::new(),
             span: Span::new(1000, 1100),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
 
         let query = Span::new(500, 800);
@@ -267,11 +321,11 @@ mod tests {
     #[test]
     fn overlapping_adjacent_not_included() {
         // Interval ending exactly at query.start is NOT overlapping (half-open)
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         rs.insert_interval(Interval {
             id: Ulid::new(),
             span: Span::new(100, 200),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
         let query = Span::new(200, 300);
         let hits: Vec<_> = rs.overlapping(&query).collect();
@@ -280,12 +334,12 @@ mod tests {
 
     #[test]
     fn overlapping_all_past() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         for i in 0..5 {
             rs.insert_interval(Interval {
                 id: Ulid::new(),
                 span: Span::new(i * 100, i * 100 + 50),
-                kind: IntervalKind::Booking,
+                kind: IntervalKind::Booking { label: None },
             });
         }
         // All intervals end before 1000
@@ -296,12 +350,12 @@ mod tests {
 
     #[test]
     fn overlapping_all_future() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         for i in 10..15 {
             rs.insert_interval(Interval {
                 id: Ulid::new(),
                 span: Span::new(i * 100, i * 100 + 50),
-                kind: IntervalKind::Booking,
+                kind: IntervalKind::Booking { label: None },
             });
         }
         // All intervals start at 1000+, query ends at 500
@@ -312,7 +366,7 @@ mod tests {
 
     #[test]
     fn overlapping_large_interval_spanning_query() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         // One huge interval that starts before and ends after the query
         rs.insert_interval(Interval {
             id: Ulid::new(),
@@ -326,7 +380,7 @@ mod tests {
 
     #[test]
     fn overlapping_empty_resource() {
-        let rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         let query = Span::new(0, 1000);
         let hits: Vec<_> = rs.overlapping(&query).collect();
         assert!(hits.is_empty());
@@ -334,12 +388,12 @@ mod tests {
 
     #[test]
     fn overlapping_single_ms_overlap() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         // Interval [100, 201) overlaps query [200, 300) by exactly 1ms
         rs.insert_interval(Interval {
             id: Ulid::new(),
             span: Span::new(100, 201),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
         let query = Span::new(200, 300);
         let hits: Vec<_> = rs.overlapping(&query).collect();
@@ -348,11 +402,11 @@ mod tests {
 
     #[test]
     fn remove_nonexistent_returns_none() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         rs.insert_interval(Interval {
             id: Ulid::new(),
             span: Span::new(100, 200),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         });
         let result = rs.remove_interval(Ulid::new());
         assert!(result.is_none());
@@ -361,13 +415,13 @@ mod tests {
 
     #[test]
     fn remove_middle_preserves_order() {
-        let mut rs = ResourceState::new(Ulid::new(), None, 1, None);
+        let mut rs = ResourceState::new(Ulid::new(), None, None, 1, None);
         let ids: Vec<Ulid> = (0..3).map(|_| Ulid::new()).collect();
         for (i, &id) in ids.iter().enumerate() {
             rs.insert_interval(Interval {
                 id,
                 span: Span::new((i as Ms) * 100, (i as Ms) * 100 + 50),
-                kind: IntervalKind::Booking,
+                kind: IntervalKind::Booking { label: None },
             });
         }
         rs.remove_interval(ids[1]); // remove middle
@@ -404,7 +458,7 @@ mod tests {
         let bk = Interval {
             id: Ulid::new(),
             span: Span::new(0, 100),
-            kind: IntervalKind::Booking,
+            kind: IntervalKind::Booking { label: None },
         };
         assert!(bk.is_allocation());
     }
@@ -414,6 +468,7 @@ mod tests {
         let event = Event::ResourceCreated {
             id: Ulid::new(),
             parent_id: None,
+            name: Some("Test".into()),
             capacity: 1,
             buffer_after: None,
         };

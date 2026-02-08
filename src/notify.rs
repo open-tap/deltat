@@ -56,6 +56,7 @@ mod tests {
         let event = Event::ResourceCreated {
             id: rid,
             parent_id: None,
+            name: None,
             capacity: 1,
             buffer_after: None,
         };

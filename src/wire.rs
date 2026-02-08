@@ -63,11 +63,12 @@ impl DeltaTHandler {
             Command::InsertResource {
                 id,
                 parent_id,
+                name,
                 capacity,
                 buffer_after,
             } => {
                 engine
-                    .create_resource(id, parent_id, capacity, buffer_after)
+                    .create_resource(id, parent_id, name, capacity, buffer_after)
                     .await
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
@@ -115,9 +116,10 @@ impl DeltaTHandler {
                 resource_id,
                 start,
                 end,
+                label,
             } => {
                 engine
-                    .confirm_booking(id, resource_id, Span::new(start, end))
+                    .confirm_booking(id, resource_id, Span::new(start, end), label)
                     .await
                     .map_err(engine_err)?;
                 Ok(vec![Response::Execution(Tag::new("INSERT").with_rows(1))])
@@ -126,7 +128,7 @@ impl DeltaTHandler {
                 let count = bookings.len();
                 let batch: Vec<_> = bookings
                     .into_iter()
-                    .map(|(id, resource_id, start, end)| (id, resource_id, Span::new(start, end)))
+                    .map(|(id, resource_id, start, end, label)| (id, resource_id, Span::new(start, end), label))
                     .collect();
                 engine
                     .batch_confirm_bookings(batch)
@@ -168,6 +170,123 @@ impl DeltaTHandler {
                     stream::iter(rows),
                 ))])
             }
+            Command::SelectMultiAvailability {
+                resource_ids,
+                start,
+                end,
+                min_available,
+                min_duration,
+            } => {
+                let slots = engine
+                    .compute_multi_availability(&resource_ids, start, end, min_available, min_duration)
+                    .await
+                    .map_err(engine_err)?;
+
+                let schema = Arc::new(multi_availability_schema());
+
+                let rows: Vec<PgWireResult<_>> = slots
+                    .into_iter()
+                    .map(|slot| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&slot.start)?;
+                        encoder.encode_field(&slot.end)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+
+                Ok(vec![Response::Query(QueryResponse::new(
+                    schema,
+                    stream::iter(rows),
+                ))])
+            }
+            Command::UpdateResource { id, name, capacity, buffer_after } => {
+                engine
+                    .update_resource(id, name, capacity, buffer_after)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
+            }
+            Command::UpdateRule { id, start, end, blocking } => {
+                engine
+                    .update_rule(id, Span::new(start, end), blocking)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(vec![Response::Execution(Tag::new("UPDATE").with_rows(1))])
+            }
+            Command::SelectResources { parent_id } => {
+                let all = engine.list_resources();
+                let filtered: Vec<_> = match parent_id {
+                    None => all,
+                    Some(None) => all.into_iter().filter(|r| r.parent_id.is_none()).collect(),
+                    Some(Some(pid)) => all.into_iter().filter(|r| r.parent_id == Some(pid)).collect(),
+                };
+
+                let schema = Arc::new(resources_schema());
+                let rows: Vec<PgWireResult<_>> = filtered
+                    .into_iter()
+                    .map(|r| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&r.id.to_string())?;
+                        encoder.encode_field(&r.parent_id.map(|p| p.to_string()))?;
+                        encoder.encode_field(&r.name)?;
+                        encoder.encode_field(&(r.capacity as i64))?;
+                        encoder.encode_field(&r.buffer_after)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+            }
+            Command::SelectRules { resource_id } => {
+                let rules = engine.get_rules(resource_id).await.map_err(engine_err)?;
+                let schema = Arc::new(rules_schema());
+                let rows: Vec<PgWireResult<_>> = rules
+                    .into_iter()
+                    .map(|r| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&r.id.to_string())?;
+                        encoder.encode_field(&r.resource_id.to_string())?;
+                        encoder.encode_field(&r.start)?;
+                        encoder.encode_field(&r.end)?;
+                        encoder.encode_field(&r.blocking)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+            }
+            Command::SelectBookings { resource_id } => {
+                let bookings = engine.get_bookings(resource_id).await.map_err(engine_err)?;
+                let schema = Arc::new(bookings_schema());
+                let rows: Vec<PgWireResult<_>> = bookings
+                    .into_iter()
+                    .map(|b| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&b.id.to_string())?;
+                        encoder.encode_field(&b.resource_id.to_string())?;
+                        encoder.encode_field(&b.start)?;
+                        encoder.encode_field(&b.end)?;
+                        encoder.encode_field(&b.label)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+            }
+            Command::SelectHolds { resource_id } => {
+                let holds = engine.get_holds(resource_id).await.map_err(engine_err)?;
+                let schema = Arc::new(holds_schema());
+                let rows: Vec<PgWireResult<_>> = holds
+                    .into_iter()
+                    .map(|h| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        encoder.encode_field(&h.id.to_string())?;
+                        encoder.encode_field(&h.resource_id.to_string())?;
+                        encoder.encode_field(&h.start)?;
+                        encoder.encode_field(&h.end)?;
+                        encoder.encode_field(&h.expires_at)?;
+                        Ok(encoder.take_row())
+                    })
+                    .collect();
+                Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(rows)))])
+            }
             Command::Listen { channel } => {
                 let resource_id_str = channel.strip_prefix("resource_").ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -200,6 +319,53 @@ fn availability_schema() -> Vec<FieldInfo> {
         ),
         FieldInfo::new("start".into(), None, None, Type::INT8, FieldFormat::Text),
         FieldInfo::new("end".into(), None, None, Type::INT8, FieldFormat::Text),
+    ]
+}
+
+fn multi_availability_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("start".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("end".into(), None, None, Type::INT8, FieldFormat::Text),
+    ]
+}
+
+fn resources_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("parent_id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("name".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("capacity".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("buffer_after".into(), None, None, Type::INT8, FieldFormat::Text),
+    ]
+}
+
+fn rules_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("resource_id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("start".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("end".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("blocking".into(), None, None, Type::BOOL, FieldFormat::Text),
+    ]
+}
+
+fn bookings_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("resource_id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("start".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("end".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("label".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+    ]
+}
+
+fn holds_schema() -> Vec<FieldInfo> {
+    vec![
+        FieldInfo::new("id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("resource_id".into(), None, None, Type::VARCHAR, FieldFormat::Text),
+        FieldInfo::new("start".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("end".into(), None, None, Type::INT8, FieldFormat::Text),
+        FieldInfo::new("expires_at".into(), None, None, Type::INT8, FieldFormat::Text),
     ]
 }
 
@@ -251,12 +417,7 @@ impl QueryParser for DeltaTQueryParser {
         stmt: &String,
         _column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        let upper = stmt.to_uppercase();
-        if upper.contains("SELECT") && upper.contains("AVAILABILITY") {
-            Ok(availability_schema())
-        } else {
-            Ok(vec![])
-        }
+        Ok(schema_for_sql(stmt))
     }
 }
 
@@ -300,15 +461,7 @@ impl ExtendedQueryHandler for DeltaTHandler {
         PgWireError: From<C::Error>,
     {
         let param_types = vec![Type::VARCHAR; count_params(&target.statement)];
-        let sql_upper = target.statement.to_uppercase();
-        if sql_upper.contains("SELECT") && sql_upper.contains("AVAILABILITY") {
-            Ok(DescribeStatementResponse::new(
-                param_types,
-                availability_schema(),
-            ))
-        } else {
-            Ok(DescribeStatementResponse::new(param_types, vec![]))
-        }
+        Ok(DescribeStatementResponse::new(param_types, schema_for_sql(&target.statement)))
     }
 
     async fn do_describe_portal<C>(
@@ -322,12 +475,7 @@ impl ExtendedQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
-        let sql_upper = target.statement.statement.to_uppercase();
-        if sql_upper.contains("SELECT") && sql_upper.contains("AVAILABILITY") {
-            Ok(DescribePortalResponse::new(availability_schema()))
-        } else {
-            Ok(DescribePortalResponse::new(vec![]))
-        }
+        Ok(DescribePortalResponse::new(schema_for_sql(&target.statement.statement)))
     }
 }
 
@@ -420,6 +568,30 @@ impl PgWireServerHandlers for DeltaTFactory {
     }
 }
 
+fn schema_for_sql(sql: &str) -> Vec<FieldInfo> {
+    let upper = sql.to_uppercase();
+    if !upper.contains("SELECT") {
+        return vec![];
+    }
+    if upper.contains("AVAILABILITY") {
+        if upper.contains(" IN ") {
+            multi_availability_schema()
+        } else {
+            availability_schema()
+        }
+    } else if upper.contains("RESOURCES") {
+        resources_schema()
+    } else if upper.contains("RULES") {
+        rules_schema()
+    } else if upper.contains("BOOKINGS") {
+        bookings_schema()
+    } else if upper.contains("HOLDS") {
+        holds_schema()
+    } else {
+        vec![]
+    }
+}
+
 fn engine_err(e: crate::engine::EngineError) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".into(),
@@ -434,4 +606,176 @@ fn sql_err(e: crate::sql::SqlError) -> PgWireError {
         "42601".into(),
         e.to_string(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── count_params ─────────────────────────────────────────────
+
+    #[test]
+    fn count_params_none() {
+        assert_eq!(count_params("SELECT * FROM resources"), 0);
+    }
+
+    #[test]
+    fn count_params_single() {
+        assert_eq!(count_params("SELECT * FROM resources WHERE id = $1"), 1);
+    }
+
+    #[test]
+    fn count_params_multiple() {
+        assert_eq!(
+            count_params("INSERT INTO rules (id, resource_id, start, \"end\", blocking) VALUES ($1, $2, $3, $4, $5)"),
+            5
+        );
+    }
+
+    #[test]
+    fn count_params_out_of_order() {
+        assert_eq!(count_params("SELECT $3, $1, $2"), 3);
+    }
+
+    #[test]
+    fn count_params_double_digit() {
+        assert_eq!(count_params("SELECT $10, $1"), 10);
+    }
+
+    #[test]
+    fn count_params_dollar_no_digit() {
+        // "$" followed by non-digit should not count
+        assert_eq!(count_params("SELECT $foo"), 0);
+    }
+
+    // ── schema_for_sql ───────────────────────────────────────────
+
+    #[test]
+    fn schema_for_select_availability() {
+        let schema = schema_for_sql("SELECT * FROM availability WHERE resource_id = $1");
+        assert_eq!(schema.len(), 3);
+        assert_eq!(schema[0].name(), "resource_id");
+    }
+
+    #[test]
+    fn schema_for_select_multi_availability() {
+        let schema = schema_for_sql("SELECT * FROM availability WHERE resource_id IN ($1, $2)");
+        assert_eq!(schema.len(), 2); // multi-availability has just start, end
+        assert_eq!(schema[0].name(), "start");
+    }
+
+    #[test]
+    fn schema_for_select_resources() {
+        let schema = schema_for_sql("SELECT * FROM resources");
+        assert_eq!(schema.len(), 5);
+        assert_eq!(schema[0].name(), "id");
+        assert_eq!(schema[2].name(), "name");
+    }
+
+    #[test]
+    fn schema_for_select_rules() {
+        let schema = schema_for_sql("SELECT * FROM rules WHERE resource_id = $1");
+        assert_eq!(schema.len(), 5);
+        assert_eq!(schema[4].name(), "blocking");
+    }
+
+    #[test]
+    fn schema_for_select_bookings() {
+        let schema = schema_for_sql("SELECT * FROM bookings WHERE resource_id = $1");
+        assert_eq!(schema.len(), 5);
+        assert_eq!(schema[4].name(), "label");
+    }
+
+    #[test]
+    fn schema_for_select_holds() {
+        let schema = schema_for_sql("SELECT * FROM holds WHERE resource_id = $1");
+        assert_eq!(schema.len(), 5);
+        assert_eq!(schema[4].name(), "expires_at");
+    }
+
+    #[test]
+    fn schema_for_insert_returns_empty() {
+        let schema = schema_for_sql("INSERT INTO resources (id) VALUES ($1)");
+        assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn schema_for_delete_returns_empty() {
+        let schema = schema_for_sql("DELETE FROM resources WHERE id = $1");
+        assert!(schema.is_empty());
+    }
+
+    // ── substitute_params ────────────────────────────────────────
+
+    fn make_portal(sql: &str, params: Vec<Option<bytes::Bytes>>) -> Portal<String> {
+        let stored = Arc::new(StoredStatement::new(
+            String::new(),
+            sql.to_string(),
+            vec![None; params.len()],
+        ));
+        let mut portal = Portal::<String>::default();
+        portal.statement = stored;
+        portal.parameters = params;
+        portal
+    }
+
+    #[test]
+    fn substitute_basic() {
+        let portal = make_portal(
+            "SELECT * FROM resources WHERE id = $1",
+            vec![Some(bytes::Bytes::from_static(b"01ARZ3NDEKTSV4RRFFQ69G5FAV"))],
+        );
+        let result = substitute_params(&portal);
+        assert_eq!(
+            result,
+            "SELECT * FROM resources WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'"
+        );
+    }
+
+    #[test]
+    fn substitute_null_param() {
+        let portal = make_portal(
+            "INSERT INTO resources (id, parent_id) VALUES ($1, $2)",
+            vec![
+                Some(bytes::Bytes::from_static(b"01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+                None,
+            ],
+        );
+        let result = substitute_params(&portal);
+        assert!(result.contains("NULL"));
+        assert!(result.contains("'01ARZ3NDEKTSV4RRFFQ69G5FAV'"));
+    }
+
+    #[test]
+    fn substitute_escapes_quotes() {
+        let portal = make_portal(
+            "INSERT INTO resources (id, parent_id, name) VALUES ($1, NULL, $2)",
+            vec![
+                Some(bytes::Bytes::from_static(b"01ARZ3NDEKTSV4RRFFQ69G5FAV")),
+                Some(bytes::Bytes::from_static(b"O'Brien's Room")),
+            ],
+        );
+        let result = substitute_params(&portal);
+        assert!(result.contains("'O''Brien''s Room'"));
+    }
+
+    #[test]
+    fn substitute_multiple_params() {
+        let portal = make_portal(
+            "INSERT INTO rules (id, resource_id, start, \"end\", blocking) VALUES ($1, $2, $3, $4, $5)",
+            vec![
+                Some(bytes::Bytes::from_static(b"RULE_ID")),
+                Some(bytes::Bytes::from_static(b"RES_ID")),
+                Some(bytes::Bytes::from_static(b"1000")),
+                Some(bytes::Bytes::from_static(b"2000")),
+                Some(bytes::Bytes::from_static(b"false")),
+            ],
+        );
+        let result = substitute_params(&portal);
+        assert!(result.contains("'RULE_ID'"));
+        assert!(result.contains("'RES_ID'"));
+        assert!(result.contains("'1000'"));
+        assert!(result.contains("'2000'"));
+        assert!(result.contains("'false'"));
+    }
 }

@@ -27,6 +27,21 @@ pub async fn run_reaper(engine: Arc<Engine>) {
     }
 }
 
+/// Background task that compacts the WAL after a threshold of mutations.
+/// Checks every 10 seconds, only compacts when appends since last compaction exceed `threshold`.
+pub async fn run_compactor(engine: Arc<Engine>, threshold: u64) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        if engine.wal_appends_since_compact().await >= threshold {
+            match engine.compact_wal().await {
+                Ok(()) => info!("WAL compacted"),
+                Err(e) => tracing::warn!("WAL compaction failed: {e}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,7 +66,7 @@ mod tests {
 
         let rid = Ulid::new();
         engine
-            .create_resource(rid, None, 1, None)
+            .create_resource(rid, None, None, 1, None)
             .await
             .unwrap();
 
