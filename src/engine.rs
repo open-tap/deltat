@@ -50,7 +50,12 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                         }
                         Ok(other) => {
                             // Flush current batch first, then handle the non-append command
+                            metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE)
+                                .record(batch.len() as f64);
+                            let flush_start = std::time::Instant::now();
                             let result = flush_batch(&mut wal, &mut batch);
+                            metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
+                                .record(flush_start.elapsed().as_secs_f64());
                             respond_batch(&mut batch, &result);
                             handle_non_append(&mut wal, other);
                             break;
@@ -60,7 +65,12 @@ async fn wal_writer_loop(mut wal: Wal, mut rx: mpsc::Receiver<WalCommand>) {
                 }
 
                 if !batch.is_empty() {
+                    metrics::histogram!(crate::observability::WAL_FLUSH_BATCH_SIZE)
+                        .record(batch.len() as f64);
+                    let flush_start = std::time::Instant::now();
                     let result = flush_batch(&mut wal, &mut batch);
+                    metrics::histogram!(crate::observability::WAL_FLUSH_DURATION_SECONDS)
+                        .record(flush_start.elapsed().as_secs_f64());
                     respond_batch(&mut batch, &result);
                 }
             }

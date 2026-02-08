@@ -12,6 +12,11 @@ use deltat::wire;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    let metrics_port: Option<u16> = std::env::var("DELTAT_METRICS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    deltat::observability::init(metrics_port);
+
     let port = std::env::var("DELTAT_PORT").unwrap_or_else(|_| "5433".into());
     let bind = std::env::var("DELTAT_BIND").unwrap_or_else(|_| "0.0.0.0".into());
     let data_dir = std::env::var("DELTAT_DATA_DIR").unwrap_or_else(|_| "./data".into());
@@ -25,6 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
+    let tls_cert = std::env::var("DELTAT_TLS_CERT").ok();
+    let tls_key = std::env::var("DELTAT_TLS_KEY").ok();
+    let tls_acceptor =
+        deltat::tls::load_tls_acceptor(tls_cert.as_deref(), tls_key.as_deref())?;
+
     // Ensure data directory exists
     std::fs::create_dir_all(&data_dir)?;
 
@@ -36,6 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("deltat listening on {addr}");
     info!("  data_dir: {data_dir}");
     info!("  max_connections: {max_connections}");
+    info!("  tls: {}", if tls_acceptor.is_some() { "enabled" } else { "disabled" });
+    info!("  metrics: {}", metrics_port.map_or("disabled".to_string(), |p| format!("http://0.0.0.0:{p}/metrics")));
 
     // Graceful shutdown: stop accepting on SIGTERM/ctrl-c, drain in-flight connections
     let shutdown = async {
@@ -72,20 +84,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(permit) => permit,
                     Err(_) => {
                         tracing::warn!("connection limit reached, rejecting {peer}");
+                        metrics::counter!(deltat::observability::CONNECTIONS_REJECTED_TOTAL).increment(1);
                         drop(socket);
                         continue;
                     }
                 };
 
                 info!("connection from {peer}");
+                metrics::counter!(deltat::observability::CONNECTIONS_TOTAL).increment(1);
+                metrics::gauge!(deltat::observability::CONNECTIONS_ACTIVE).increment(1.0);
                 let tm = tenant_manager.clone();
                 let pw = password.clone();
+                let tls = tls_acceptor.clone();
 
                 tokio::spawn(async move {
                     let _permit = permit; // held until connection closes
-                    if let Err(e) = wire::process_connection(socket, tm, pw).await {
+                    if let Err(e) = wire::process_connection(socket, tm, pw, tls).await {
                         tracing::error!("connection error from {peer}: {e}");
                     }
+                    metrics::gauge!(deltat::observability::CONNECTIONS_ACTIVE).decrement(1.0);
                 });
             }
             _ = &mut shutdown => {

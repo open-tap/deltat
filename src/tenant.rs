@@ -71,6 +71,7 @@ impl TenantManager {
         });
 
         self.engines.insert(tenant.to_string(), engine.clone());
+        metrics::gauge!(crate::observability::TENANTS_ACTIVE).set(self.engines.len() as f64);
         Ok(engine)
     }
 }

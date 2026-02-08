@@ -30,7 +30,7 @@ async fn start_test_server() -> (SocketAddr, Arc<TenantManager>) {
             };
             let tm = tm2.clone();
             tokio::spawn(async move {
-                let _ = wire::process_connection(socket, tm, "deltat".to_string()).await;
+                let _ = wire::process_connection(socket, tm, "deltat".to_string(), None).await;
             });
         }
     });

@@ -105,6 +105,22 @@ impl DeltaTHandler {
         engine: &Engine,
         cmd: Command,
     ) -> PgWireResult<Vec<Response>> {
+        let label = crate::observability::command_label(&cmd);
+        let start = std::time::Instant::now();
+        let result = self.execute_command_inner(engine, cmd).await;
+        let status = if result.is_ok() { "ok" } else { "error" };
+        metrics::counter!(crate::observability::QUERIES_TOTAL, "command" => label, "status" => status)
+            .increment(1);
+        metrics::histogram!(crate::observability::QUERY_DURATION_SECONDS, "command" => label)
+            .record(start.elapsed().as_secs_f64());
+        result
+    }
+
+    async fn execute_command_inner(
+        &self,
+        engine: &Engine,
+        cmd: Command,
+    ) -> PgWireResult<Vec<Response>> {
         match cmd {
             Command::InsertResource {
                 id,
@@ -595,12 +611,13 @@ pub async fn process_connection(
     tcp_socket: TcpStream,
     tenant_manager: Arc<TenantManager>,
     password: String,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Negotiate TLS (no TLS acceptor for now)
+    // 1. Negotiate TLS
     let mut socket: Framed<
         pgwire::tokio::server::MaybeTls,
         pgwire::tokio::server::PgWireMessageServerCodec<String>,
-    > = match pgwire::tokio::server::negotiate_tls::<String>(tcp_socket, None).await? {
+    > = match pgwire::tokio::server::negotiate_tls::<String>(tcp_socket, tls_acceptor).await? {
         Some(s) => s,
         None => return Ok(()),
     };
@@ -652,7 +669,17 @@ pub async fn process_connection(
                     .await
                     {
                         tracing::debug!("startup error: {e}");
-                        break;
+                        metrics::counter!(crate::observability::AUTH_FAILURES_TOTAL).increment(1);
+                        if pgwire::tokio::server::process_error(
+                            &mut socket,
+                            e,
+                            false,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
                 _ => break,
