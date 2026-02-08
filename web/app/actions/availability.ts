@@ -21,3 +21,14 @@ export async function getMultiResourceAvailability(
   );
   return Object.fromEntries(results);
 }
+
+/** Combined availability across multiple resources.
+ *  Returns time spans where at least `minAvailable` of the resources are free. */
+export async function getCombinedAvailability(
+  resourceIds: string[],
+  start: number,
+  end: number,
+  minAvailable?: number
+): Promise<{ start: number; end: number }[]> {
+  return db.getMultiResourceAvailabilityIntersection(resourceIds, start, end, minAvailable);
+}

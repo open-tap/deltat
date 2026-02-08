@@ -18,6 +18,7 @@ export async function createResources(input: {
       parentId: parsed.parentId,
       slotMinutes: 60,
       bufferMinutes: 0,
+      price: null,
     };
     store.setResource(resource);
     created.push(resource);

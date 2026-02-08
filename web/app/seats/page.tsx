@@ -6,14 +6,14 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { SeatMap } from "@/components/seat-map";
+import { cn } from "@/lib/utils";
+import { SeatMap, type SeatSection } from "@/components/seat-map";
 import { CancelBookingDialog } from "@/components/booking-dialog";
 import type { Resource, AvailabilitySlot, Booking } from "@/lib/schemas";
-import { cn } from "@/lib/utils";
 
 import { seed } from "../actions/seed";
 import { getResources } from "../actions/resources";
-import { getMultiResourceAvailability } from "../actions/availability";
+import { getAvailability, getMultiResourceAvailability } from "../actions/availability";
 import { getMultiResourceBookings, batchBookSlots, cancelBooking } from "../actions/bookings";
 
 function toLocalDateString(date: Date): string {
@@ -22,19 +22,64 @@ function toLocalDateString(date: Date): string {
   return local.toISOString().slice(0, 10);
 }
 
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function formatDuration(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+/** Build sections from a 3-level hierarchy: venue → section → seats. */
+function buildSections(venueId: string, resources: Resource[]): SeatSection[] {
+  const children = resources.filter((r) => r.parentId === venueId);
+  const sections: SeatSection[] = [];
+
+  for (const child of children) {
+    const grandchildren = resources.filter((r) => r.parentId === child.id);
+    if (grandchildren.length > 0) {
+      sections.push({
+        id: child.id,
+        name: child.name,
+        price: child.price,
+        seats: grandchildren.map((s) => ({ id: s.id, name: s.name })),
+      });
+    }
+  }
+
+  if (sections.length === 0 && children.length > 0) {
+    const venue = resources.find((r) => r.id === venueId);
+    sections.push({
+      id: venueId,
+      name: venue?.name ?? "Seats",
+      price: venue?.price ?? null,
+      seats: children.map((s) => ({ id: s.id, name: s.name })),
+    });
+  }
+
+  return sections;
+}
+
+function allSeatIds(sections: SeatSection[]): string[] {
+  return sections.flatMap((s) => s.seats.map((seat) => seat.id));
+}
+
 export default function SeatsPage() {
   const [resources, setResources] = useState<Resource[]>([]);
   const [loading, setLoading] = useState(true);
   const [isPending, startTransition] = useTransition();
 
-  // Which parent resource (plane/screen) is selected
-  const [parentId, setParentId] = useState<string | null>(null);
-
-  // Time slot selection
+  const [venueId, setVenueId] = useState<string | null>(null);
   const [date, setDate] = useState(toLocalDateString(new Date()));
-  const [time, setTime] = useState("09:00");
 
-  // Seat data
+  // Available time slots for the venue on this date (auto-discovered)
+  const [venueSlots, setVenueSlots] = useState<AvailabilitySlot[]>([]);
+  const [selectedSlot, setSelectedSlot] = useState<{ start: number; end: number } | null>(null);
+
+  // Seat data (loaded when a time slot is selected)
   const [availability, setAvailability] = useState<Map<string, AvailabilitySlot[]>>(new Map());
   const [bookings, setBookings] = useState<Map<string, Booking[]>>(new Map());
   const [selectedSeats, setSelectedSeats] = useState<Set<string>>(new Set());
@@ -44,20 +89,35 @@ export default function SeatsPage() {
   const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
   const [cancelTarget, setCancelTarget] = useState<Booking | null>(null);
 
-  const parentResource = resources.find((r) => r.id === parentId) ?? null;
-  const seats = resources.filter((r) => r.parentId === parentId);
-  const slotMinutes = parentResource?.slotMinutes ?? 60;
+  const venue = resources.find((r) => r.id === venueId) ?? null;
+  const sections = venueId ? buildSections(venueId, resources) : [];
 
-  // Compute slot times
-  const slotStart = new Date(`${date}T${time}`).getTime();
-  const slotEnd = slotStart + slotMinutes * 60_000;
-
-  // All parent resources that have children (potential seat maps)
-  const parentResources = resources.filter((r) =>
-    resources.some((c) => c.parentId === r.id)
+  const venues = resources.filter(
+    (r) => r.parentId === null && resources.some((c) => c.parentId === r.id)
   );
 
-  // Load data
+  // Query venue-level availability when venue or date changes
+  useEffect(() => {
+    if (!venueId || !date) return;
+    const dayStart = new Date(`${date}T00:00`).getTime();
+    if (isNaN(dayStart)) return;
+    const dayEnd = dayStart + 86_400_000;
+
+    getAvailability(venueId, dayStart, dayEnd)
+      .then((slots) => {
+        setVenueSlots(slots);
+        setSelectedSlot(null);
+        setAvailability(new Map());
+        setBookings(new Map());
+        setSelectedSeats(new Set());
+      })
+      .catch((err) => {
+        console.error("Failed to get venue availability:", err);
+        setVenueSlots([]);
+      });
+  }, [venueId, date, resources]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Load seat data when a time slot is selected
   const loadSeatData = useCallback(
     async (seatIds: string[], start: number, end: number) => {
       if (seatIds.length === 0) return;
@@ -80,6 +140,14 @@ export default function SeatsPage() {
     []
   );
 
+  useEffect(() => {
+    if (!selectedSlot || !venueId) return;
+    const seatIds = allSeatIds(buildSections(venueId, resources));
+    if (seatIds.length === 0) return;
+    loadSeatData(seatIds, selectedSlot.start, selectedSlot.end);
+    setSelectedSeats(new Set());
+  }, [selectedSlot]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Seed on mount
   useEffect(() => {
     async function init() {
@@ -87,17 +155,10 @@ export default function SeatsPage() {
         await seed();
         const all = await getResources();
         setResources(all);
-        // Auto-select first parent that has children
-        const parents = all.filter((r) =>
-          all.some((c) => c.parentId === r.id)
+        const topLevel = all.filter(
+          (r) => r.parentId === null && all.some((c) => c.parentId === r.id)
         );
-        // Prefer "Flight" parent over "Theater"
-        const plane = parents.find((p) => p.name.toLowerCase().includes("flight"));
-        if (plane) {
-          setParentId(plane.id);
-        } else if (parents.length > 0) {
-          setParentId(parents[0].id);
-        }
+        if (topLevel.length > 0) setVenueId(topLevel[0].id);
       } catch (err) {
         console.error("Failed to seed:", err);
         toast.error("Failed to connect to deltat. Is it running?");
@@ -108,18 +169,6 @@ export default function SeatsPage() {
     init();
   }, []);
 
-  // Reload when parent/date/time changes
-  useEffect(() => {
-    if (!parentId || !date || !time) return;
-    const seatIds = resources.filter((r) => r.parentId === parentId).map((r) => r.id);
-    if (seatIds.length === 0) return;
-    const start = new Date(`${date}T${time}`).getTime();
-    const end = start + (parentResource?.slotMinutes ?? 60) * 60_000;
-    if (isNaN(start)) return;
-    loadSeatData(seatIds, start, end);
-    setSelectedSeats(new Set());
-  }, [parentId, date, time, resources]); // eslint-disable-line react-hooks/exhaustive-deps
-
   function handleToggleSeat(seatId: string) {
     setSelectedSeats((prev) => {
       const next = new Set(prev);
@@ -129,23 +178,31 @@ export default function SeatsPage() {
     });
   }
 
+  function getSeatSection(seatId: string): SeatSection | undefined {
+    return sections.find((s) => s.seats.some((seat) => seat.id === seatId));
+  }
+
+  const selectedTotal = Array.from(selectedSeats).reduce((sum, seatId) => {
+    const section = getSeatSection(seatId);
+    return sum + (section?.price ?? 0);
+  }, 0);
+
   async function handleBookSelected() {
-    if (selectedSeats.size === 0) return;
+    if (selectedSeats.size === 0 || !selectedSlot) return;
     startTransition(async () => {
       try {
         const slots = Array.from(selectedSeats).map((seatId) => ({
           resourceId: seatId,
-          start: slotStart,
-          end: slotEnd,
+          start: selectedSlot.start,
+          end: selectedSlot.end,
           label: bookingLabel,
         }));
         await batchBookSlots(slots);
         toast.success(`Booked ${slots.length} seat${slots.length > 1 ? "s" : ""}`);
         setSelectedSeats(new Set());
         setBookingLabel("");
-        // Reload
-        const seatIds = seats.map((r) => r.id);
-        await loadSeatData(seatIds, slotStart, slotEnd);
+        const seatIds = allSeatIds(sections);
+        await loadSeatData(seatIds, selectedSlot.start, selectedSlot.end);
       } catch (err: any) {
         toast.error(err.message ?? "Booking failed — seats may be taken");
       }
@@ -158,14 +215,14 @@ export default function SeatsPage() {
   }
 
   async function handleCancelConfirm() {
-    if (!cancelTarget) return;
+    if (!cancelTarget || !selectedSlot) return;
     setCancelDialogOpen(false);
     startTransition(async () => {
       try {
         await cancelBooking(cancelTarget.id);
         toast.success("Booking cancelled");
-        const seatIds = seats.map((r) => r.id);
-        await loadSeatData(seatIds, slotStart, slotEnd);
+        const seatIds = allSeatIds(sections);
+        await loadSeatData(seatIds, selectedSlot.start, selectedSlot.end);
       } catch (err: any) {
         toast.error(err.message ?? "Failed to cancel booking");
       }
@@ -184,6 +241,14 @@ export default function SeatsPage() {
     setDate(toLocalDateString(d));
   }
 
+  function seatName(seatId: string): string {
+    for (const s of sections) {
+      const seat = s.seats.find((x) => x.id === seatId);
+      if (seat) return seat.name;
+    }
+    return seatId;
+  }
+
   if (loading) {
     return (
       <div className="flex h-screen items-center justify-center">
@@ -200,17 +265,23 @@ export default function SeatsPage() {
           <a href="/" className="text-sm text-muted-foreground hover:text-foreground">
             Calendar
           </a>
+          <a href="/schedule" className="text-sm text-muted-foreground hover:text-foreground">
+            Schedule
+          </a>
+          <a href="/bookings" className="text-sm text-muted-foreground hover:text-foreground">
+            Bookings
+          </a>
           <h1 className="text-sm font-semibold">Seat Map</h1>
         </div>
 
-        {/* Parent selector */}
+        {/* Venue selector */}
         <div className="flex items-center gap-2">
-          {parentResources.map((r) => (
+          {venues.map((r) => (
             <Button
               key={r.id}
-              variant={r.id === parentId ? "default" : "outline"}
+              variant={r.id === venueId ? "default" : "outline"}
               size="sm"
-              onClick={() => setParentId(r.id)}
+              onClick={() => setVenueId(r.id)}
             >
               {r.name}
             </Button>
@@ -220,65 +291,130 @@ export default function SeatsPage() {
 
       {/* Controls + map */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left: controls */}
-        <div className="w-64 shrink-0 border-r p-4 space-y-6">
-          <div className="space-y-2">
-            <Label className="text-xs font-medium">Date</Label>
-            <div className="flex items-center gap-1">
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={prevDay}>
-                <ChevronLeft className="h-4 w-4" />
-              </Button>
-              <Input
-                type="date"
-                value={date}
-                onChange={(e) => setDate(e.target.value)}
-                className="text-sm"
-              />
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={nextDay}>
-                <ChevronRight className="h-4 w-4" />
-              </Button>
+        {/* Left sidebar: date + available times + booking */}
+        <div className="w-64 shrink-0 border-r flex flex-col">
+          <div className="p-4 space-y-4 border-b">
+            {/* Date picker */}
+            <div className="space-y-2">
+              <Label className="text-xs font-medium">Date</Label>
+              <div className="flex items-center gap-1">
+                <Button variant="ghost" size="icon" className="h-8 w-8" onClick={prevDay}>
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <Input
+                  type="date"
+                  value={date}
+                  onChange={(e) => setDate(e.target.value)}
+                  className="text-sm"
+                />
+                <Button variant="ghost" size="icon" className="h-8 w-8" onClick={nextDay}>
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
             </div>
+
+            {/* Venue info */}
+            {venue && (
+              <div className="rounded-md bg-muted/50 p-3 text-xs space-y-0.5">
+                <div className="font-medium text-foreground">{venue.name}</div>
+                <div className="text-muted-foreground">
+                  {formatDuration(venue.slotMinutes)} per slot
+                  {venue.bufferMinutes > 0 && ` · ${venue.bufferMinutes}m buffer`}
+                </div>
+              </div>
+            )}
           </div>
 
-          <div className="space-y-2">
-            <Label className="text-xs font-medium">Start Time</Label>
-            <Input
-              type="time"
-              value={time}
-              onChange={(e) => setTime(e.target.value)}
-              className="text-sm"
-            />
+          {/* Available times */}
+          <div className="flex-1 min-h-0 overflow-auto p-4 space-y-2">
+            <Label className="text-xs font-medium">
+              {venueSlots.length > 0
+                ? `${venueSlots.length} Available Time${venueSlots.length > 1 ? "s" : ""}`
+                : "Available Times"}
+            </Label>
+
+            {venueSlots.length === 0 ? (
+              <div className="rounded-md border border-dashed p-4 text-center">
+                <div className="text-xs text-muted-foreground">
+                  No availability on this date
+                </div>
+                <div className="text-[10px] text-muted-foreground/70 mt-1">
+                  Try another date
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {venueSlots.map((slot, i) => {
+                  const isActive =
+                    selectedSlot?.start === slot.start && selectedSlot?.end === slot.end;
+                  const durMin = Math.round((slot.end - slot.start) / 60_000);
+
+                  return (
+                    <button
+                      key={i}
+                      className={cn(
+                        "w-full rounded-md border px-3 py-2.5 text-left transition-all",
+                        isActive
+                          ? "border-emerald-500 bg-emerald-50 ring-1 ring-emerald-200"
+                          : "border-border hover:border-emerald-300 hover:bg-emerald-50/50"
+                      )}
+                      onClick={() =>
+                        setSelectedSlot(
+                          isActive ? null : { start: slot.start, end: slot.end }
+                        )
+                      }
+                    >
+                      <div className="text-sm font-semibold">
+                        {formatTime(slot.start)}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {formatTime(slot.start)} – {formatTime(slot.end)} · {formatDuration(durMin)}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
-          <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground space-y-1">
-            <div>Slot: {slotMinutes} min</div>
-            <div>
-              {new Date(slotStart).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
-              {" – "}
-              {new Date(slotEnd).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
-            </div>
-          </div>
-
-          {selectedSeats.size > 0 && (
-            <div className="space-y-3 border-t pt-4">
+          {/* Selected seats + booking */}
+          {selectedSeats.size > 0 && selectedSlot && (
+            <div className="border-t p-4 space-y-3">
               <div className="text-sm font-medium">
                 {selectedSeats.size} seat{selectedSeats.size > 1 ? "s" : ""} selected
               </div>
               <div className="flex flex-wrap gap-1">
                 {Array.from(selectedSeats)
-                  .map((id) => seats.find((s) => s.id === id)?.name ?? id)
-                  .sort()
-                  .map((name) => (
+                  .map((id) => {
+                    const section = getSeatSection(id);
+                    return {
+                      id,
+                      name: seatName(id),
+                      price: section?.price,
+                    };
+                  })
+                  .sort((a, b) => a.name.localeCompare(b.name))
+                  .map(({ id, name, price }) => (
                     <span
-                      key={name}
+                      key={id}
                       className="rounded bg-emerald-100 px-1.5 py-0.5 text-xs font-medium text-emerald-700"
                     >
                       {name}
+                      {price !== null && price !== undefined && (
+                        <span className="ml-0.5 text-emerald-500">${price}</span>
+                      )}
                     </span>
                   ))}
               </div>
+              {selectedTotal > 0 && (
+                <div className="text-sm font-semibold">
+                  Total: ${selectedTotal.toLocaleString()}
+                </div>
+              )}
               <div className="space-y-2">
-                <Label htmlFor="seat-label" className="text-xs">Label (optional)</Label>
+                <Label htmlFor="seat-label" className="text-xs">
+                  Label (optional)
+                </Label>
                 <Input
                   id="seat-label"
                   placeholder="e.g. John Smith"
@@ -289,6 +425,7 @@ export default function SeatsPage() {
               </div>
               <Button className="w-full" onClick={handleBookSelected} disabled={isPending}>
                 Book {selectedSeats.size} Seat{selectedSeats.size > 1 ? "s" : ""}
+                {selectedTotal > 0 && ` · $${selectedTotal.toLocaleString()}`}
               </Button>
             </div>
           )}
@@ -296,21 +433,44 @@ export default function SeatsPage() {
 
         {/* Right: seat map */}
         <div className="flex-1 flex items-center justify-center overflow-auto p-8">
-          {!parentId ? (
+          {!venueId ? (
             <div className="text-sm text-muted-foreground">
-              Select a resource to view its seat map
+              Select a venue to view its seat map
             </div>
-          ) : seats.length === 0 ? (
+          ) : venueSlots.length === 0 ? (
+            <div className="text-center space-y-2">
+              <div className="text-sm text-muted-foreground">
+                No availability on this date
+              </div>
+              <div className="text-xs text-muted-foreground/70">
+                {venue?.name} has no scheduled events for{" "}
+                {new Date(date + "T00:00").toLocaleDateString(undefined, {
+                  weekday: "long",
+                  month: "long",
+                  day: "numeric",
+                })}
+              </div>
+            </div>
+          ) : !selectedSlot ? (
+            <div className="text-center space-y-2">
+              <div className="text-sm text-muted-foreground">
+                Select a time slot to view available seats
+              </div>
+              <div className="text-xs text-muted-foreground/70">
+                {venueSlots.length} time{venueSlots.length > 1 ? "s" : ""} available — pick one from the left
+              </div>
+            </div>
+          ) : sections.length === 0 ? (
             <div className="text-sm text-muted-foreground">
-              No seats found for this resource
+              No seats found for this venue
             </div>
           ) : (
             <SeatMap
-              seats={seats.map((s) => ({ id: s.id, name: s.name }))}
+              sections={sections}
               availabilityByResource={availability}
               bookingsByResource={bookings}
-              slotStart={slotStart}
-              slotEnd={slotEnd}
+              slotStart={selectedSlot.start}
+              slotEnd={selectedSlot.end}
               selectedIds={selectedSeats}
               onToggle={handleToggleSeat}
               onBookingClick={handleBookingClick}
@@ -324,9 +484,7 @@ export default function SeatsPage() {
         <CancelBookingDialog
           open={cancelDialogOpen}
           onOpenChange={setCancelDialogOpen}
-          resourceName={
-            seats.find((s) => s.id === cancelTarget.resourceId)?.name ?? ""
-          }
+          resourceName={seatName(cancelTarget.resourceId)}
           start={cancelTarget.start}
           end={cancelTarget.end}
           onConfirm={handleCancelConfirm}

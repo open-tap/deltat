@@ -348,9 +348,17 @@ export default function Home() {
       <div className="w-72 shrink-0 border-r flex flex-col">
         <div className="flex items-center justify-between border-b px-4 py-1.5">
           <span className="text-xs font-medium">Calendar</span>
-          <a href="/seats" className="text-xs text-muted-foreground hover:text-foreground">
-            Seat Map &rarr;
-          </a>
+          <div className="flex gap-2">
+            <a href="/seats" className="text-xs text-muted-foreground hover:text-foreground">
+              Seats
+            </a>
+            <a href="/schedule" className="text-xs text-muted-foreground hover:text-foreground">
+              Schedule
+            </a>
+            <a href="/bookings" className="text-xs text-muted-foreground hover:text-foreground">
+              Bookings
+            </a>
+          </div>
         </div>
         <div className="flex-1 min-h-0">
           <ResourceTree

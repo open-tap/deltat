@@ -86,3 +86,25 @@ export async function getAvailability(
     end: Number(row.end),
   }));
 }
+
+/** Multi-resource availability: find time spans where at least `minAvailable`
+ *  of the given resources are simultaneously free.
+ *  - minAvailable = ids.length → intersection (ALL must be free)
+ *  - minAvailable = 1 → union (ANY one free)
+ */
+export async function getMultiResourceAvailabilityIntersection(
+  resourceIds: string[],
+  start: number,
+  end: number,
+  minAvailable?: number
+): Promise<{ start: number; end: number }[]> {
+  if (resourceIds.length === 0) return [];
+  const inList = resourceIds.map((id) => `'${id}'`).join(", ");
+  const minAvail = minAvailable ?? resourceIds.length;
+  const sql = `SELECT * FROM availability WHERE resource_id IN (${inList}) AND start >= ${start} AND "end" <= ${end} AND min_available = ${minAvail}`;
+  const rows = await db.unsafe(sql);
+  return rows.map((row: Record<string, unknown>) => ({
+    start: Number(row.start),
+    end: Number(row.end),
+  }));
+}

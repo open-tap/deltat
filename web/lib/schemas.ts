@@ -6,6 +6,7 @@ export const ResourceSchema = z.object({
   name: z.string().min(1),
   slotMinutes: z.number().default(60),
   bufferMinutes: z.number().default(0),
+  price: z.number().nullable().default(null),
 });
 
 export type Resource = z.infer<typeof ResourceSchema>;

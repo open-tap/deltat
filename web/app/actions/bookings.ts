@@ -57,6 +57,10 @@ export async function getBookingsForResource(
   return store.getBookingsForResource(resourceId);
 }
 
+export async function getAllBookings(): Promise<Booking[]> {
+  return store.getBookings();
+}
+
 export async function getMultiResourceBookings(
   resourceIds: string[]
 ): Promise<Record<string, Booking[]>> {
