@@ -87,6 +87,33 @@ export async function getAvailability(
   }));
 }
 
+export async function placeHold(
+  id: string,
+  resourceId: string,
+  start: number,
+  end: number,
+  expiresAt: number
+): Promise<void> {
+  await db`INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES (${id}, ${resourceId}, ${start}, ${end}, ${expiresAt})`;
+}
+
+export async function releaseHold(id: string): Promise<void> {
+  await db`DELETE FROM holds WHERE id = ${id}`;
+}
+
+export async function getHoldsForResource(
+  resourceId: string
+): Promise<{ id: string; resourceId: string; start: number; end: number; expiresAt: number }[]> {
+  const rows = await db`SELECT * FROM holds WHERE resource_id = ${resourceId}`;
+  return rows.map((row: Record<string, unknown>) => ({
+    id: String(row.id),
+    resourceId: String(row.resource_id),
+    start: Number(row.start),
+    end: Number(row.end),
+    expiresAt: Number(row.expires_at),
+  }));
+}
+
 /** Multi-resource availability: find time spans where at least `minAvailable`
  *  of the given resources are simultaneously free.
  *  - minAvailable = ids.length → intersection (ALL must be free)

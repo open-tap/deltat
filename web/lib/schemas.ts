@@ -73,3 +73,13 @@ export const RecurringRuleInput = z.object({
 });
 
 export type BookSlotInput = z.infer<typeof BookSlotInput>;
+
+export const HoldSchema = z.object({
+  id: z.string(),
+  resourceId: z.string(),
+  start: z.number(),
+  end: z.number(),
+  expiresAt: z.number(),
+});
+
+export type Hold = z.infer<typeof HoldSchema>;

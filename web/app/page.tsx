@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useTransition } from "react";
+import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { ResourceTree } from "@/components/resource-tree";
 import { WeekCalendar } from "@/components/week-calendar";
@@ -336,30 +337,19 @@ export default function Home() {
 
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="text-sm text-muted-foreground">Connecting to deltat...</div>
+      <div className="flex h-full items-center justify-center">
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Connecting to deltat...
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex h-screen">
+    <div className="flex h-full">
       {/* Left sidebar: resource tree + rules panel */}
       <div className="w-72 shrink-0 border-r flex flex-col">
-        <div className="flex items-center justify-between border-b px-4 py-1.5">
-          <span className="text-xs font-medium">Calendar</span>
-          <div className="flex gap-2">
-            <a href="/seats" className="text-xs text-muted-foreground hover:text-foreground">
-              Seats
-            </a>
-            <a href="/schedule" className="text-xs text-muted-foreground hover:text-foreground">
-              Schedule
-            </a>
-            <a href="/bookings" className="text-xs text-muted-foreground hover:text-foreground">
-              Bookings
-            </a>
-          </div>
-        </div>
         <div className="flex-1 min-h-0">
           <ResourceTree
             resources={resources}
@@ -474,7 +464,10 @@ export default function Home() {
 
       {isPending && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/50">
-          <div className="text-sm text-muted-foreground">Working...</div>
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Working...
+          </div>
         </div>
       )}
     </div>

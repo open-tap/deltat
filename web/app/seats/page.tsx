@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useTransition } from "react";
 import { toast } from "sonner";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -251,28 +251,20 @@ export default function SeatsPage() {
 
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="text-sm text-muted-foreground">Connecting to deltat...</div>
+      <div className="flex h-full items-center justify-center">
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Connecting to deltat...
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-full flex-col">
       {/* Top bar */}
       <div className="flex items-center justify-between border-b px-6 py-3">
-        <div className="flex items-center gap-4">
-          <a href="/" className="text-sm text-muted-foreground hover:text-foreground">
-            Calendar
-          </a>
-          <a href="/schedule" className="text-sm text-muted-foreground hover:text-foreground">
-            Schedule
-          </a>
-          <a href="/bookings" className="text-sm text-muted-foreground hover:text-foreground">
-            Bookings
-          </a>
-          <h1 className="text-sm font-semibold">Seat Map</h1>
-        </div>
+        <h1 className="text-sm font-semibold">Seat Map</h1>
 
         {/* Venue selector */}
         <div className="flex items-center gap-2">
@@ -493,7 +485,10 @@ export default function SeatsPage() {
 
       {isPending && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/50">
-          <div className="text-sm text-muted-foreground">Working...</div>
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Working...
+          </div>
         </div>
       )}
     </div>
