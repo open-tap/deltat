@@ -3,6 +3,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use ulid::Ulid;
 
+use crate::limits::MAX_IN_CLAUSE_IDS;
 use crate::model::*;
 
 /// Parsed command from SQL input.
@@ -352,6 +353,13 @@ fn extract_availability_filters(
         // resource_id IN ('id1', 'id2', ...)
         Expr::InList { expr: col_expr, list, negated } if !negated => {
             if expr_column_name(col_expr).as_deref() == Some("resource_id") {
+                if list.len() > MAX_IN_CLAUSE_IDS {
+                    return Err(SqlError::Parse(format!(
+                        "IN clause too large: {} IDs (max {})",
+                        list.len(),
+                        MAX_IN_CLAUSE_IDS
+                    )));
+                }
                 for item in list {
                     f.resource_ids.push(parse_ulid_expr(item)?);
                 }
@@ -1332,5 +1340,33 @@ mod tests {
         let sql = "DELETE FROM rules WHERE id = '01ARZ3NDEKTSV4RRFFQ69G5FAV'";
         let cmd = parse_sql(sql).unwrap();
         assert!(matches!(cmd, Command::DeleteRule { .. }));
+    }
+
+    #[test]
+    fn in_clause_too_many_ids() {
+        let ids: Vec<String> = (0..MAX_IN_CLAUSE_IDS + 1)
+            .map(|_| format!("'{}'", ulid::Ulid::new()))
+            .collect();
+        let sql = format!(
+            "SELECT * FROM availability WHERE resource_id IN ({}) AND start >= 0 AND \"end\" <= 10000",
+            ids.join(", ")
+        );
+        let result = parse_sql(&sql);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("IN clause too large"));
+    }
+
+    #[test]
+    fn in_clause_at_limit() {
+        let ids: Vec<String> = (0..MAX_IN_CLAUSE_IDS)
+            .map(|_| format!("'{}'", ulid::Ulid::new()))
+            .collect();
+        let sql = format!(
+            "SELECT * FROM availability WHERE resource_id IN ({}) AND start >= 0 AND \"end\" <= 10000",
+            ids.join(", ")
+        );
+        let result = parse_sql(&sql);
+        assert!(result.is_ok());
     }
 }

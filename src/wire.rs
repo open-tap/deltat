@@ -22,6 +22,7 @@ use ulid::Ulid;
 
 use crate::auth::DeltaTAuthSource;
 use crate::engine::Engine;
+use crate::limits::MAX_QUERY_LEN;
 use crate::model::*;
 use crate::sql::{self, Command};
 use crate::tenant::TenantManager;
@@ -381,6 +382,13 @@ impl SimpleQueryHandler for DeltaTHandler {
         C::Error: Debug,
         PgWireError: From<C::Error>,
     {
+        if query.len() > MAX_QUERY_LEN {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "54000".into(),
+                "query too long".into(),
+            ))));
+        }
         let engine = self.resolve_engine(client)?;
         let cmd = sql::parse_sql(query).map_err(sql_err)?;
         self.execute_command(&engine, cmd).await
@@ -444,6 +452,13 @@ impl ExtendedQueryHandler for DeltaTHandler {
     {
         let engine = self.resolve_engine(client)?;
         let sql = substitute_params(portal);
+        if sql.len() > MAX_QUERY_LEN {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "54000".into(),
+                "query too long".into(),
+            ))));
+        }
         let cmd = sql::parse_sql(&sql).map_err(sql_err)?;
         let mut responses = self.execute_command(&engine, cmd).await?;
         Ok(responses.remove(0))

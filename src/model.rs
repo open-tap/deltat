@@ -13,7 +13,7 @@ pub struct Span {
 
 impl Span {
     pub fn new(start: Ms, end: Ms) -> Self {
-        debug_assert!(start < end, "Span start must be before end");
+        assert!(start < end, "Span start must be before end");
         Self { start, end }
     }
 
@@ -461,6 +461,12 @@ mod tests {
             kind: IntervalKind::Booking { label: None },
         };
         assert!(bk.is_allocation());
+    }
+
+    #[test]
+    #[should_panic(expected = "Span start must be before end")]
+    fn span_assert_start_before_end() {
+        Span::new(200, 100);
     }
 
     #[test]

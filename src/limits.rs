@@ -1,0 +1,14 @@
+pub const MAX_QUERY_WINDOW_MS: i64 = 90 * 86_400_000; // 90 days
+pub const MAX_SPAN_DURATION_MS: i64 = 3650 * 86_400_000; // ~10 years
+pub const MIN_VALID_TIMESTAMP_MS: i64 = 0; // epoch
+pub const MAX_VALID_TIMESTAMP_MS: i64 = 32_503_680_000_000; // year 3000
+pub const MAX_BATCH_SIZE: usize = 1_000;
+pub const MAX_IN_CLAUSE_IDS: usize = 1_000;
+pub const MAX_INTERVALS_PER_RESOURCE: usize = 100_000;
+pub const MAX_RESOURCES_PER_TENANT: usize = 100_000;
+pub const MAX_TENANTS: usize = 1_000;
+pub const MAX_HIERARCHY_DEPTH: usize = 50;
+pub const MAX_NAME_LEN: usize = 1_000;
+pub const MAX_LABEL_LEN: usize = 10_000;
+pub const MAX_TENANT_NAME_LEN: usize = 256;
+pub const MAX_QUERY_LEN: usize = 1_048_576; // 1MB
