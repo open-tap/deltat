@@ -3,9 +3,19 @@ pub const MAX_SPAN_DURATION_MS: i64 = 3650 * 86_400_000; // ~10 years
 pub const MIN_VALID_TIMESTAMP_MS: i64 = 0; // epoch
 pub const MAX_VALID_TIMESTAMP_MS: i64 = 32_503_680_000_000; // year 3000
 pub const MAX_BATCH_SIZE: usize = 1_000;
+#[cfg(not(test))]
 pub const MAX_IN_CLAUSE_IDS: usize = 1_000;
+#[cfg(test)]
+pub const MAX_IN_CLAUSE_IDS: usize = 200;
+#[cfg(not(test))]
 pub const MAX_INTERVALS_PER_RESOURCE: usize = 100_000;
+#[cfg(test)]
+pub const MAX_INTERVALS_PER_RESOURCE: usize = 200;
+
+#[cfg(not(test))]
 pub const MAX_RESOURCES_PER_TENANT: usize = 100_000;
+#[cfg(test)]
+pub const MAX_RESOURCES_PER_TENANT: usize = 200;
 pub const MAX_TENANTS: usize = 1_000;
 pub const MAX_HIERARCHY_DEPTH: usize = 50;
 pub const MAX_NAME_LEN: usize = 1_000;

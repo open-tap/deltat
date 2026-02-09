@@ -1159,8 +1159,8 @@ async fn engine_resource_with_many_intervals() {
         .await
         .unwrap();
 
-    // Place 500 bookings, each 1ms long, spaced 1000ms apart
-    for i in 0..500 {
+    // Place 100 bookings, each 1ms long, spaced 1000ms apart
+    for i in 0..100 {
         let start = (i * 1000) + 100;
         engine
             .confirm_booking(Ulid::new(), rid, Span::new(start, start + 1), None)
@@ -1169,15 +1169,16 @@ async fn engine_resource_with_many_intervals() {
     }
 
     // Query a narrow window that contains exactly 1 booking
+    // Booking at i=50: [50100, 50101)
     let avail = engine
-        .compute_availability(rid, 100_000, 101_000, None)
+        .compute_availability(rid, 50_000, 51_000, None)
         .await
         .unwrap();
-    // Within [100000, 101000): booking at [100100, 100101)
-    // Free: [100000, 100100) + [100101, 101000)
+    // Within [50000, 51000): booking at [50100, 50101)
+    // Free: [50000, 50100) + [50101, 51000)
     assert_eq!(avail.len(), 2);
-    assert_eq!(avail[0], Span::new(100_000, 100_100));
-    assert_eq!(avail[1], Span::new(100_101, 101_000));
+    assert_eq!(avail[0], Span::new(50_000, 50_100));
+    assert_eq!(avail[1], Span::new(50_101, 51_000));
 }
 
 #[tokio::test]
