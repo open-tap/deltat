@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">deltat</h1>
-  <p align="center">A time-allocation database built on 1D collision detection.</p>
+  <p align="center">A time-first scheduling database.</p>
 </p>
 
 ---
@@ -9,15 +9,13 @@
 
 In a video game, a collision engine answers one question: do these two objects overlap?
 
-deltat does the same thing — but on a single axis: **time**.
+Scheduling is the same problem in one dimension. A booking is a segment on the number line of time. Two bookings conflict when their segments collide. That's the entire model.
 
 ```
- ──────[  Flight 6am–12pm  ]──────────────────────────────
- ────────────[  Dentist 2–3pm  ]──────────────────────────
- ──────────────────────[  Hotel Mon–Fri  ]────────────────
+ ──────[  Flight  ]───────────────────────────────────────
+ ────────────[  Dentist  ]────────────────────────────────
+ ──────────────────────[  Hotel  ]────────────────────────
 ```
-
-A booking is a segment on the timeline. Two bookings conflict when their segments collide. That's the entire model.
 
 Everything in scheduling is just an extension of this:
 
@@ -31,7 +29,7 @@ Everything in scheduling is just an extension of this:
 | **Hold** | A segment that fades away after a timer |
 | **Availability** | The gaps between everything already placed |
 
-deltat is a database built entirely around this.
+deltat is a database built entirely around this insight. It operates purely on raw `i64` Unix milliseconds — no time zones, no calendars, no date formats. Human-readable time is a display concern that belongs in the client. The database just sees numbers on a line, which means it will work unchanged as long as 64-bit integers exist.
 
 ## What it is
 
