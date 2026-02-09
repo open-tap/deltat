@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">deltat</h1>
-  <p align="center">A 1D collision engine for time.</p>
+  <p align="center">A time-allocation database built on 1D collision detection.</p>
 </p>
 
 ---
