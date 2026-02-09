@@ -17,7 +17,7 @@ Scheduling is the same problem in one dimension. A booking is a segment range on
  ──────────────────────[  Hotel  ]────────────────────────
 ```
 
-Everything in scheduling is just an extension of this:
+Everything in scheduling is just an extension of this primitive:
 
 | Concept | What it means |
 |---|---|
@@ -26,10 +26,14 @@ Everything in scheduling is just an extension of this:
 | **Capacity** | How many segments can stack on the same point |
 | **Buffer** | A forced gap after each segment |
 | **Rule** | A region of the line marked open or closed |
-| **Hold** | A segment that fades away after a timer |
+| **Hold** | A segment with a self-destruct timer |
 | **Availability** | The gaps between everything already placed |
 
-deltat is a database built entirely around this insight. It operates purely on raw `i64` Unix milliseconds — no time zones, no calendars, no date formats. Human-readable time is a display concern that belongs in the client. The database just sees numbers on a line, which means it will work unchanged as long as 64-bit integers exist.
+deltat is a database built entirely around this primitive. It operates purely on raw `i64` Unix milliseconds — no time zones, no calendars, no date formats. No pricing, no user profiles, no business data. Just segments on a number line.
+
+Scheduling has historically been painful because it was forced into relational databases that weren't designed for it — time intervals, collision detection, and availability queries bolted onto tables built for storing rows. deltat inverts that. Time isn't a column in someone else's schema. It's the entire database.
+
+Human-readable time is a display concern that belongs in the client. The database just sees numbers on a line, which means it will work unchanged as long as 64-bit integers exist.
 
 ## What it is
 
