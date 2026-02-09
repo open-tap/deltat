@@ -3,17 +3,18 @@ mod conflict;
 mod error;
 mod mutations;
 mod queries;
+mod store;
 #[cfg(test)]
 mod tests;
 
 pub use availability::{availability, compute_saturated_spans, merge_overlapping, subtract_intervals};
 pub use error::EngineError;
+pub use store::InMemoryStore;
 
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use ulid::Ulid;
 
@@ -133,103 +134,9 @@ fn handle_non_append(wal: &mut Wal, cmd: WalCommand) {
 }
 
 pub struct Engine {
-    pub state: DashMap<Ulid, SharedResourceState>,
+    pub(super) store: InMemoryStore,
     pub(super) wal_tx: mpsc::Sender<WalCommand>,
     pub notify: Arc<NotifyHub>,
-    /// Reverse lookup: entity (rule/allocation) id → resource id
-    pub(super) entity_to_resource: DashMap<Ulid, Ulid>,
-    /// Parent → children index for O(1) child lookups.
-    pub(super) children: DashMap<Ulid, Vec<Ulid>>,
-}
-
-/// Apply an event directly to a ResourceState (no locking — caller holds the lock).
-fn apply_to_resource(rs: &mut ResourceState, event: &Event, entity_map: &DashMap<Ulid, Ulid>) {
-    match event {
-        Event::RuleAdded {
-            id,
-            resource_id,
-            span,
-            blocking,
-        } => {
-            let kind = if *blocking {
-                IntervalKind::Blocking
-            } else {
-                IntervalKind::NonBlocking
-            };
-            rs.insert_interval(Interval {
-                id: *id,
-                span: *span,
-                kind,
-            });
-            entity_map.insert(*id, *resource_id);
-        }
-        Event::RuleUpdated {
-            id,
-            resource_id,
-            span,
-            blocking,
-        } => {
-            rs.remove_interval(*id);
-            let kind = if *blocking {
-                IntervalKind::Blocking
-            } else {
-                IntervalKind::NonBlocking
-            };
-            rs.insert_interval(Interval {
-                id: *id,
-                span: *span,
-                kind,
-            });
-            entity_map.insert(*id, *resource_id);
-        }
-        Event::RuleRemoved { id, .. } => {
-            rs.remove_interval(*id);
-            entity_map.remove(id);
-        }
-        Event::HoldPlaced {
-            id,
-            resource_id,
-            span,
-            expires_at,
-        } => {
-            rs.insert_interval(Interval {
-                id: *id,
-                span: *span,
-                kind: IntervalKind::Hold {
-                    expires_at: *expires_at,
-                },
-            });
-            entity_map.insert(*id, *resource_id);
-        }
-        Event::HoldReleased { id, .. } => {
-            rs.remove_interval(*id);
-            entity_map.remove(id);
-        }
-        Event::BookingConfirmed {
-            id,
-            resource_id,
-            span,
-            label,
-        } => {
-            rs.insert_interval(Interval {
-                id: *id,
-                span: *span,
-                kind: IntervalKind::Booking { label: label.clone() },
-            });
-            entity_map.insert(*id, *resource_id);
-        }
-        Event::BookingCancelled { id, .. } => {
-            rs.remove_interval(*id);
-            entity_map.remove(id);
-        }
-        Event::ResourceUpdated { name, capacity, buffer_after, .. } => {
-            rs.name = name.clone();
-            rs.capacity = *capacity;
-            rs.buffer_after = *buffer_after;
-        }
-        // ResourceCreated/Deleted are handled at the DashMap level, not here
-        Event::ResourceCreated { .. } | Event::ResourceDeleted { .. } => {}
-    }
 }
 
 impl Engine {
@@ -239,12 +146,11 @@ impl Engine {
         let (wal_tx, wal_rx) = mpsc::channel(4096);
         tokio::spawn(wal_writer_loop(wal, wal_rx));
 
+        let store = InMemoryStore::new();
         let engine = Self {
-            state: DashMap::new(),
+            store,
             wal_tx,
             notify,
-            entity_to_resource: DashMap::new(),
-            children: DashMap::new(),
         };
 
         // Replay events — we're the sole owner of these Arcs, so try_read/try_write
@@ -254,28 +160,26 @@ impl Engine {
             match event {
                 Event::ResourceCreated { id, parent_id, name, capacity, buffer_after } => {
                     let rs = ResourceState::new(*id, *parent_id, name.clone(), *capacity, *buffer_after);
-                    engine.state.insert(*id, Arc::new(RwLock::new(rs)));
+                    engine.store.insert_resource(*id, Arc::new(RwLock::new(rs)));
                     if let Some(pid) = parent_id {
-                        engine.children.entry(*pid).or_default().push(*id);
+                        engine.store.add_child(*pid, *id);
                     }
                 }
                 Event::ResourceDeleted { id } => {
-                    if let Some(entry) = engine.state.get(id) {
-                        let rs = entry.try_read().expect("replay: uncontended read");
-                        if let Some(pid) = rs.parent_id
-                            && let Some(mut kids) = engine.children.get_mut(&pid) {
-                                kids.retain(|c| c != id);
-                            }
+                    if let Some(rs) = engine.store.get_resource(id) {
+                        let guard = rs.try_read().expect("replay: uncontended read");
+                        if let Some(pid) = guard.parent_id {
+                            engine.store.remove_child(&pid, id);
+                        }
                     }
-                    engine.state.remove(id);
+                    engine.store.remove_resource(id);
                 }
                 other => {
                     let resource_id = event_resource_id(other);
                     if let Some(resource_id) = resource_id
-                        && let Some(entry) = engine.state.get(&resource_id) {
-                            let rs_arc = entry.clone();
-                            let mut guard = rs_arc.try_write().expect("replay: uncontended write");
-                            apply_to_resource(&mut guard, other, &engine.entity_to_resource);
+                        && let Some(rs) = engine.store.get_resource(&resource_id) {
+                            let mut guard = rs.try_write().expect("replay: uncontended write");
+                            engine.store.apply_event(&mut guard, other);
                         }
                 }
             }
@@ -300,11 +204,11 @@ impl Engine {
     }
 
     pub fn get_resource(&self, id: &Ulid) -> Option<SharedResourceState> {
-        self.state.get(id).map(|e| e.value().clone())
+        self.store.get_resource(id)
     }
 
     pub fn get_resource_for_entity(&self, entity_id: &Ulid) -> Option<Ulid> {
-        self.entity_to_resource.get(entity_id).map(|e| *e.value())
+        self.store.get_resource_for_entity(entity_id)
     }
 
     /// WAL-append + apply + notify in one call. Eliminates the repeated 3-line pattern.
@@ -315,7 +219,7 @@ impl Engine {
         event: &Event,
     ) -> Result<(), EngineError> {
         self.wal_append(event).await?;
-        apply_to_resource(rs, event, &self.entity_to_resource);
+        self.store.apply_event(rs, event);
         self.notify.send(resource_id, event);
         Ok(())
     }

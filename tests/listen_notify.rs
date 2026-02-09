@@ -19,7 +19,7 @@ async fn start_test_server() -> (SocketAddr, Arc<TenantManager>) {
 
     let dir = std::env::temp_dir().join(format!("deltat_int_test_{}", Ulid::new()));
     std::fs::create_dir_all(&dir).unwrap();
-    let tm = Arc::new(TenantManager::new(dir, 1000));
+    let tm = Arc::new(TenantManager::new(dir, 1000, 604_800_000));
 
     let tm2 = tm.clone();
     tokio::spawn(async move {

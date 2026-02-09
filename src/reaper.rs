@@ -27,6 +27,26 @@ pub async fn run_reaper(engine: Arc<Engine>) {
     }
 }
 
+/// Background task that periodically collects past bookings and expired holds.
+pub async fn run_gc(engine: Arc<Engine>, retention_ms: i64) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let collected = engine.gc_past_intervals(now, retention_ms);
+        if collected > 0 {
+            info!("GC collected {collected} intervals");
+            match engine.compact_wal().await {
+                Ok(()) => info!("WAL compacted after GC"),
+                Err(e) => tracing::warn!("WAL compaction after GC failed: {e}"),
+            }
+        }
+    }
+}
+
 /// Background task that compacts the WAL after a threshold of mutations.
 /// Checks every 10 seconds, only compacts when appends since last compaction exceed `threshold`.
 pub async fn run_compactor(engine: Arc<Engine>, threshold: u64) {

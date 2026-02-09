@@ -167,20 +167,20 @@ impl Engine {
     }
 
     pub fn list_resources(&self) -> Vec<ResourceInfo> {
-        self.state
-            .iter()
-            .map(|entry| {
-                let rs = entry.value().clone();
-                let guard = rs.try_read().expect("list_resources: uncontended read");
-                ResourceInfo {
-                    id: guard.id,
-                    parent_id: guard.parent_id,
-                    name: guard.name.clone(),
-                    capacity: guard.capacity,
-                    buffer_after: guard.buffer_after,
+        let mut result = Vec::new();
+        for rid in self.store.resource_ids() {
+            if let Some(rs) = self.store.get_resource(&rid)
+                && let Ok(guard) = rs.try_read() {
+                    result.push(ResourceInfo {
+                        id: guard.id,
+                        parent_id: guard.parent_id,
+                        name: guard.name.clone(),
+                        capacity: guard.capacity,
+                        buffer_after: guard.buffer_after,
+                    });
                 }
-            })
-            .collect()
+        }
+        result
     }
 
     pub async fn get_rules(&self, resource_id: Ulid) -> Result<Vec<RuleInfo>, EngineError> {

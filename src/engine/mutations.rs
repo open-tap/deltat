@@ -9,7 +9,7 @@ use crate::model::*;
 
 use super::availability::subtract_intervals;
 use super::conflict::{check_no_conflict, now_ms, validate_span};
-use super::{apply_to_resource, Engine, EngineError, SharedResourceState, WalCommand};
+use super::{Engine, EngineError, WalCommand};
 
 impl Engine {
     pub async fn create_resource(
@@ -20,7 +20,7 @@ impl Engine {
         capacity: u32,
         buffer_after: Option<Ms>,
     ) -> Result<(), EngineError> {
-        if self.state.len() >= MAX_RESOURCES_PER_TENANT {
+        if self.store.resource_count() >= MAX_RESOURCES_PER_TENANT {
             return Err(EngineError::LimitExceeded("too many resources"));
         }
         if let Some(ref n) = name
@@ -40,14 +40,14 @@ impl Engine {
                 });
             }
         }
-        if self.state.contains_key(&id) {
+        if self.store.contains_resource(&id) {
             return Err(EngineError::AlreadyExists(id));
         }
         if let Some(pid) = parent_id {
             if pid == id {
                 return Err(EngineError::CycleDetected(id));
             }
-            if !self.state.contains_key(&pid) {
+            if !self.store.contains_resource(&pid) {
                 return Err(EngineError::NotFound(pid));
             }
         }
@@ -55,34 +55,32 @@ impl Engine {
         let event = Event::ResourceCreated { id, parent_id, name: name.clone(), capacity, buffer_after };
         self.wal_append(&event).await?;
         let rs = ResourceState::new(id, parent_id, name, capacity, buffer_after);
-        self.state.insert(id, Arc::new(RwLock::new(rs)));
+        self.store.insert_resource(id, Arc::new(RwLock::new(rs)));
         if let Some(pid) = parent_id {
-            self.children.entry(pid).or_default().push(id);
+            self.store.add_child(pid, id);
         }
         self.notify.send(id, &event);
         Ok(())
     }
 
     pub async fn delete_resource(&self, id: Ulid) -> Result<(), EngineError> {
-        if !self.state.contains_key(&id) {
+        if !self.store.contains_resource(&id) {
             return Err(EngineError::NotFound(id));
         }
-        if let Some(kids) = self.children.get(&id)
-            && !kids.is_empty() {
-                return Err(EngineError::HasChildren(id));
-            }
+        if self.store.has_children(&id) {
+            return Err(EngineError::HasChildren(id));
+        }
 
         let rs = self.get_resource(&id).unwrap();
         let guard = rs.read().await;
-        if let Some(pid) = guard.parent_id
-            && let Some(mut kids) = self.children.get_mut(&pid) {
-                kids.retain(|c| c != &id);
-            }
+        if let Some(pid) = guard.parent_id {
+            self.store.remove_child(&pid, &id);
+        }
         drop(guard);
 
         let event = Event::ResourceDeleted { id };
         self.wal_append(&event).await?;
-        self.state.remove(&id);
+        self.store.remove_resource(&id);
         self.notify.send(id, &event);
         Ok(())
     }
@@ -261,7 +259,7 @@ impl Engine {
             let event = Event::BookingConfirmed { id, resource_id, span, label };
             self.wal_append(&event).await?;
             let guard_idx = rs_map[&resource_id];
-            apply_to_resource(&mut guards[guard_idx], &event, &self.entity_to_resource);
+            self.store.apply_event(&mut guards[guard_idx], &event);
             self.notify.send(resource_id, &event);
         }
 
@@ -310,18 +308,59 @@ impl Engine {
 
     pub fn collect_expired_holds(&self, now: Ms) -> Vec<(Ulid, Ulid)> {
         let mut expired = Vec::new();
-        for entry in self.state.iter() {
-            let rs = entry.value().clone();
-            if let Ok(guard) = rs.try_read() {
-                for interval in &guard.intervals {
-                    if let IntervalKind::Hold { expires_at } = interval.kind
-                        && expires_at <= now {
-                            expired.push((interval.id, guard.id));
-                        }
+        for rid in self.store.resource_ids() {
+            if let Some(rs) = self.store.get_resource(&rid)
+                && let Ok(guard) = rs.try_read() {
+                    for interval in &guard.intervals {
+                        if let IntervalKind::Hold { expires_at } = interval.kind
+                            && expires_at <= now {
+                                expired.push((interval.id, guard.id));
+                            }
+                    }
                 }
-            }
         }
         expired
+    }
+
+    /// Remove past bookings and expired holds older than `retention_ms`.
+    /// Rules are never collected. Skips locked resources (best-effort).
+    /// Returns count of collected intervals.
+    pub fn gc_past_intervals(&self, now: Ms, retention_ms: Ms) -> usize {
+        let cutoff = now - retention_ms;
+        let mut collected = 0usize;
+
+        for rid in self.store.resource_ids() {
+            let rs = match self.store.get_resource(&rid) {
+                Some(rs) => rs,
+                None => continue,
+            };
+            let mut guard = match rs.try_write() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+
+            let mut removed_ids = Vec::new();
+            guard.intervals.retain(|interval| {
+                let dominated = match &interval.kind {
+                    IntervalKind::Booking { .. } => interval.span.end < cutoff,
+                    IntervalKind::Hold { expires_at } => {
+                        *expires_at <= now && interval.span.end < cutoff
+                    }
+                    IntervalKind::NonBlocking | IntervalKind::Blocking => false,
+                };
+                if dominated {
+                    removed_ids.push(interval.id);
+                }
+                !dominated
+            });
+
+            for id in &removed_ids {
+                self.store.unmap_entity(id);
+            }
+            collected += removed_ids.len();
+        }
+
+        collected
     }
 
     /// Compact the WAL by rewriting it with only the events needed to recreate the current state.
@@ -331,22 +370,21 @@ impl Engine {
 
         fn emit_resource(
             id: Ulid,
-            state: &dashmap::DashMap<Ulid, SharedResourceState>,
+            store: &super::InMemoryStore,
             events: &mut Vec<Event>,
             visited: &mut HashSet<Ulid>,
         ) {
             if !visited.insert(id) {
                 return;
             }
-            let entry = match state.get(&id) {
-                Some(e) => e,
+            let rs = match store.get_resource(&id) {
+                Some(rs) => rs,
                 None => return,
             };
-            let rs = entry.value().clone();
             let guard = rs.try_read().expect("compact: uncontended read");
 
             if let Some(pid) = guard.parent_id {
-                emit_resource(pid, state, events, visited);
+                emit_resource(pid, store, events, visited);
             }
 
             events.push(Event::ResourceCreated {
@@ -387,9 +425,9 @@ impl Engine {
             }
         }
 
-        let resource_ids: Vec<Ulid> = self.state.iter().map(|e| *e.key()).collect();
+        let resource_ids = self.store.resource_ids();
         for id in resource_ids {
-            emit_resource(id, &self.state, &mut events, &mut visited);
+            emit_resource(id, &self.store, &mut events, &mut visited);
         }
 
         let (tx, rx) = oneshot::channel();

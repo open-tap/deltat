@@ -1053,6 +1053,7 @@ mod tests {
         let tm = Arc::new(TenantManager::new(
             std::env::temp_dir().join("deltat_test_wire_tm"),
             1000,
+            604_800_000,
         ));
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1091,6 +1092,7 @@ mod tests {
         let tm = Arc::new(TenantManager::new(
             std::env::temp_dir().join("deltat_test_wire_no_sub"),
             1000,
+            604_800_000,
         ));
         let handler = DeltaTHandler::new(tm);
 

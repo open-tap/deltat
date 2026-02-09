@@ -29,6 +29,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
+    let gc_retention_ms: i64 = std::env::var("DELTAT_GC_RETENTION_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(604_800_000); // 7 days
 
     let tls_cert = std::env::var("DELTAT_TLS_CERT").ok();
     let tls_key = std::env::var("DELTAT_TLS_KEY").ok();
@@ -38,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists
     std::fs::create_dir_all(&data_dir)?;
 
-    let tenant_manager = Arc::new(TenantManager::new(PathBuf::from(&data_dir), compact_threshold));
+    let tenant_manager = Arc::new(TenantManager::new(PathBuf::from(&data_dir), compact_threshold, gc_retention_ms));
     let semaphore = Arc::new(Semaphore::new(max_connections));
 
     let addr = format!("{bind}:{port}");

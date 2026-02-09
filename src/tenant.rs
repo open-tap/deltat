@@ -14,14 +14,16 @@ pub struct TenantManager {
     engines: DashMap<String, Arc<Engine>>,
     data_dir: PathBuf,
     compact_threshold: u64,
+    gc_retention_ms: i64,
 }
 
 impl TenantManager {
-    pub fn new(data_dir: PathBuf, compact_threshold: u64) -> Self {
+    pub fn new(data_dir: PathBuf, compact_threshold: u64, gc_retention_ms: i64) -> Self {
         Self {
             engines: DashMap::new(),
             data_dir,
             compact_threshold,
+            gc_retention_ms,
         }
     }
 
@@ -56,7 +58,7 @@ impl TenantManager {
         let notify = Arc::new(NotifyHub::new());
         let engine = Arc::new(Engine::new(wal_path, notify)?);
 
-        // Spawn reaper + compactor for this tenant
+        // Spawn reaper + compactor + GC for this tenant
         let reaper_engine = engine.clone();
         tokio::spawn(async move {
             reaper::run_reaper(reaper_engine).await;
@@ -65,6 +67,11 @@ impl TenantManager {
         let threshold = self.compact_threshold;
         tokio::spawn(async move {
             reaper::run_compactor(compactor_engine, threshold).await;
+        });
+        let gc_engine = engine.clone();
+        let retention = self.gc_retention_ms;
+        tokio::spawn(async move {
+            reaper::run_gc(gc_engine, retention).await;
         });
 
         self.engines.insert(tenant.to_string(), engine.clone());
@@ -90,7 +97,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_isolation() {
         let dir = test_data_dir("isolation");
-        let tm = TenantManager::new(dir, 1000);
+        let tm = TenantManager::new(dir, 1000, 604_800_000);
 
         let eng_a = tm.get_or_create("tenant_a").unwrap();
         let eng_b = tm.get_or_create("tenant_b").unwrap();
@@ -119,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_lazy_creation() {
         let dir = test_data_dir("lazy");
-        let tm = TenantManager::new(dir.clone(), 1000);
+        let tm = TenantManager::new(dir.clone(), 1000, 604_800_000);
 
         // No WAL files should exist yet
         let entries: Vec<_> = fs::read_dir(&dir).unwrap().collect();
@@ -135,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_same_engine_returned() {
         let dir = test_data_dir("same_eng");
-        let tm = TenantManager::new(dir, 1000);
+        let tm = TenantManager::new(dir, 1000, 604_800_000);
 
         let eng1 = tm.get_or_create("foo").unwrap();
         let eng2 = tm.get_or_create("foo").unwrap();
@@ -147,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_name_sanitized() {
         let dir = test_data_dir("sanitize");
-        let tm = TenantManager::new(dir.clone(), 1000);
+        let tm = TenantManager::new(dir.clone(), 1000, 604_800_000);
 
         // Path traversal attempt
         let _eng = tm.get_or_create("../evil").unwrap();
@@ -162,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_name_too_long() {
         let dir = test_data_dir("name_too_long");
-        let tm = TenantManager::new(dir, 1000);
+        let tm = TenantManager::new(dir, 1000, 604_800_000);
 
         let long_name = "x".repeat(MAX_TENANT_NAME_LEN + 1);
         let result = tm.get_or_create(&long_name);
@@ -174,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_name_at_limit() {
         let dir = test_data_dir("name_at_limit");
-        let tm = TenantManager::new(dir, 1000);
+        let tm = TenantManager::new(dir, 1000, 604_800_000);
 
         // Use a name just under the OS filename limit (256 - ".wal" = 252 is safe)
         // but at our MAX_TENANT_NAME_LEN (256). Since the WAL appends ".wal" (4 chars),
@@ -196,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn tenant_count_limit() {
         let dir = test_data_dir("count_limit");
-        let tm = TenantManager::new(dir, 1000);
+        let tm = TenantManager::new(dir, 1000, 604_800_000);
 
         for i in 0..MAX_TENANTS {
             tm.get_or_create(&format!("t{i}")).unwrap();

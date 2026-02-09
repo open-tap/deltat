@@ -1,5 +1,5 @@
 use super::*;
-use super::conflict::{check_no_conflict, now_ms, validate_span};
+use super::conflict::{now_ms, validate_span};
 use crate::limits::*;
 
 const H: Ms = 3_600_000; // 1 hour in ms
@@ -4169,4 +4169,286 @@ async fn batch_invalid_span() {
     ];
     let result = engine.batch_confirm_bookings(bookings).await;
     assert!(matches!(result, Err(EngineError::LimitExceeded("timestamp out of range"))));
+}
+
+// ── GC tests ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn gc_removes_past_bookings() {
+    let path = test_wal_path("gc_past_bookings.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let bid = Ulid::new();
+    engine.confirm_booking(bid, rid, Span::new(1000, 2000), None).await.unwrap();
+
+    // now=10000, retention=5000 → cutoff=5000 → booking ends at 2000 < 5000 → collected
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 1);
+
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert!(bookings.is_empty());
+}
+
+#[tokio::test]
+async fn gc_keeps_future_bookings() {
+    let path = test_wal_path("gc_future_bookings.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let bid = Ulid::new();
+    engine.confirm_booking(bid, rid, Span::new(8000, 9000), None).await.unwrap();
+
+    // now=10000, retention=5000 → cutoff=5000 → booking ends at 9000 > 5000 → kept
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 0);
+
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 1);
+}
+
+#[tokio::test]
+async fn gc_keeps_rules() {
+    let path = test_wal_path("gc_keeps_rules.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let rule_id = Ulid::new();
+    engine.add_rule(rule_id, rid, Span::new(1000, 2000), false).await.unwrap();
+
+    // Even with cutoff way past the rule's end, rules are never collected
+    let collected = engine.gc_past_intervals(100000, 1000);
+    assert_eq!(collected, 0);
+
+    let rules = engine.get_rules(rid).await.unwrap();
+    assert_eq!(rules.len(), 1);
+}
+
+#[tokio::test]
+async fn gc_removes_expired_past_holds() {
+    let path = test_wal_path("gc_expired_holds.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let hid = Ulid::new();
+    // Hold span [1000, 2000), expires_at=3000
+    engine.place_hold(hid, rid, Span::new(1000, 2000), 3000).await.unwrap();
+
+    // now=10000, retention=5000 → cutoff=5000
+    // expires_at=3000 <= now=10000 AND span.end=2000 < cutoff=5000 → collected
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 1);
+
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert!(holds.is_empty());
+}
+
+#[tokio::test]
+async fn gc_keeps_active_holds() {
+    let path = test_wal_path("gc_active_holds.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let hid = Ulid::new();
+    // Hold span [1000, 2000), expires_at=99999 (still active)
+    engine.place_hold(hid, rid, Span::new(1000, 2000), 99999).await.unwrap();
+
+    // now=10000 → expires_at=99999 > now → NOT expired → kept even though span is past cutoff
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 0);
+
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert_eq!(holds.len(), 1);
+}
+
+#[tokio::test]
+async fn gc_cleans_entity_index() {
+    let path = test_wal_path("gc_entity_index.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let bid = Ulid::new();
+    engine.confirm_booking(bid, rid, Span::new(1000, 2000), None).await.unwrap();
+
+    // Verify entity index has the booking
+    assert!(engine.get_resource_for_entity(&bid).is_some());
+
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 1);
+
+    // Entity index should be cleaned up
+    assert!(engine.get_resource_for_entity(&bid).is_none());
+}
+
+#[tokio::test]
+async fn gc_compact_roundtrip() {
+    let path = test_wal_path("gc_compact_roundtrip.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path.clone(), notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 50000), false).await.unwrap();
+
+    let old_bid = Ulid::new();
+    let new_bid = Ulid::new();
+    engine.confirm_booking(old_bid, rid, Span::new(1000, 2000), Some("old".into())).await.unwrap();
+    engine.confirm_booking(new_bid, rid, Span::new(20000, 30000), Some("new".into())).await.unwrap();
+
+    // GC removes old booking
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 1);
+
+    // Compact WAL
+    engine.compact_wal().await.unwrap();
+
+    // Replay from WAL — old booking should not reappear
+    let notify2 = Arc::new(crate::notify::NotifyHub::new());
+    let engine2 = Engine::new(path, notify2).unwrap();
+
+    let bookings = engine2.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 1);
+    assert_eq!(bookings[0].label, Some("new".into()));
+    assert!(engine2.get_resource_for_entity(&old_bid).is_none());
+}
+
+#[tokio::test]
+async fn gc_on_empty_resource() {
+    let path = test_wal_path("gc_empty_resource.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 0);
+}
+
+#[tokio::test]
+async fn gc_mixed_intervals_selective() {
+    let path = test_wal_path("gc_mixed.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 10, None).await.unwrap();
+    engine.add_rule(Ulid::new(), rid, Span::new(1000, 100000), false).await.unwrap();
+
+    // Old booking (should be collected)
+    let old = Ulid::new();
+    engine.confirm_booking(old, rid, Span::new(1000, 2000), None).await.unwrap();
+    // Recent booking (should stay)
+    let recent = Ulid::new();
+    engine.confirm_booking(recent, rid, Span::new(8000, 9000), None).await.unwrap();
+    // Future booking (should stay)
+    let future = Ulid::new();
+    engine.confirm_booking(future, rid, Span::new(20000, 30000), None).await.unwrap();
+    // Old expired hold (should be collected)
+    let old_hold = Ulid::new();
+    engine.place_hold(old_hold, rid, Span::new(3000, 4000), 5000).await.unwrap();
+    // Rule (should never be collected)
+    let rule = Ulid::new();
+    engine.add_rule(rule, rid, Span::new(1000, 2000), true).await.unwrap();
+
+    // now=10000, retention=5000 → cutoff=5000
+    let collected = engine.gc_past_intervals(10000, 5000);
+    assert_eq!(collected, 2); // old booking + old expired hold
+
+    let bookings = engine.get_bookings(rid).await.unwrap();
+    assert_eq!(bookings.len(), 2);
+    let holds = engine.get_holds(rid).await.unwrap();
+    assert!(holds.is_empty());
+    let rules = engine.get_rules(rid).await.unwrap();
+    assert_eq!(rules.len(), 2); // original non-blocking + blocking rule
+}
+
+#[tokio::test]
+async fn update_rule_blocking_to_non_blocking() {
+    let path = test_wal_path("update_rule_to_nb.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path, notify).unwrap();
+    let rid = Ulid::new();
+    engine.create_resource(rid, None, None, 1, None).await.unwrap();
+
+    let rule_id = Ulid::new();
+    engine.add_rule(rule_id, rid, Span::new(9 * H, 17 * H), true).await.unwrap();
+
+    // Update: make it non-blocking (covers RuleUpdated non-blocking branch in apply_event)
+    engine.update_rule(rule_id, Span::new(10 * H, 16 * H), false).await.unwrap();
+
+    let rules = engine.get_rules(rid).await.unwrap();
+    assert_eq!(rules.len(), 1);
+    assert!(!rules[0].blocking);
+    assert_eq!(rules[0].start, 10 * H);
+    assert_eq!(rules[0].end, 16 * H);
+}
+
+#[tokio::test]
+async fn replay_includes_resource_deleted() {
+    let path = test_wal_path("replay_delete.wal");
+    let notify = Arc::new(NotifyHub::new());
+    let engine = Engine::new(path.clone(), notify).unwrap();
+
+    let parent = Ulid::new();
+    let child = Ulid::new();
+    engine.create_resource(parent, None, Some("parent".into()), 1, None).await.unwrap();
+    engine.create_resource(child, Some(parent), Some("child".into()), 1, None).await.unwrap();
+
+    // Delete child, then verify replay handles ResourceDeleted + children cleanup
+    engine.delete_resource(child).await.unwrap();
+    assert!(engine.get_resource(&child).is_none());
+
+    // Replay from WAL
+    let notify2 = Arc::new(crate::notify::NotifyHub::new());
+    let engine2 = Engine::new(path, notify2).unwrap();
+
+    assert!(engine2.get_resource(&child).is_none());
+    assert!(engine2.get_resource(&parent).is_some());
+    // Parent should have no children after replay
+    let resources = engine2.list_resources();
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].id, parent);
+}
+
+#[test]
+fn store_get_children() {
+    let store = InMemoryStore::new();
+    let parent = Ulid::new();
+    let c1 = Ulid::new();
+    let c2 = Ulid::new();
+
+    // Empty initially
+    assert!(store.get_children(&parent).is_empty());
+
+    store.add_child(parent, c1);
+    store.add_child(parent, c2);
+    let kids = store.get_children(&parent);
+    assert_eq!(kids.len(), 2);
+    assert!(kids.contains(&c1));
+    assert!(kids.contains(&c2));
+
+    store.remove_child(&parent, &c1);
+    let kids = store.get_children(&parent);
+    assert_eq!(kids, vec![c2]);
+}
+
+#[test]
+fn store_default() {
+    let store = InMemoryStore::default();
+    assert_eq!(store.resource_count(), 0);
 }
