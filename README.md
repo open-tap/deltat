@@ -21,7 +21,7 @@ Everything in scheduling is just an extension of this primitive:
 
 | Concept | What it means |
 |---|---|
-| **Booking** | A segment placed on the line |
+| **Booking** | A segment placed on the timeline |
 | **Conflict** | Two segments that overlap |
 | **Capacity** | How many segments can stack on the same point |
 | **Buffer** | A forced gap after each segment |
