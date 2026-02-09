@@ -37,10 +37,7 @@ impl TenantManager {
             ));
         }
         if self.engines.len() >= MAX_TENANTS {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "too many tenants",
-            ));
+            return Err(std::io::Error::other("too many tenants"));
         }
 
         // Sanitize tenant name to prevent path traversal

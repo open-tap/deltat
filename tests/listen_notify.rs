@@ -46,7 +46,7 @@ async fn connect(
 ) {
     let mut config = Config::new();
     config
-        .host(&addr.ip().to_string())
+        .host(addr.ip().to_string())
         .port(addr.port())
         .dbname("test")
         .user("deltat")
@@ -98,9 +98,7 @@ async fn connect_and_query() {
 
     // Query it back
     let rows = client
-        .simple_query(&format!(
-            "SELECT * FROM resources"
-        ))
+        .simple_query("SELECT * FROM resources")
         .await
         .unwrap();
 

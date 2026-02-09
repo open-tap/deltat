@@ -263,23 +263,21 @@ impl Engine {
                 Event::ResourceDeleted { id } => {
                     if let Some(entry) = engine.state.get(id) {
                         let rs = entry.try_read().expect("replay: uncontended read");
-                        if let Some(pid) = rs.parent_id {
-                            if let Some(mut kids) = engine.children.get_mut(&pid) {
+                        if let Some(pid) = rs.parent_id
+                            && let Some(mut kids) = engine.children.get_mut(&pid) {
                                 kids.retain(|c| c != id);
                             }
-                        }
                     }
                     engine.state.remove(id);
                 }
                 other => {
                     let resource_id = event_resource_id(other);
-                    if let Some(resource_id) = resource_id {
-                        if let Some(entry) = engine.state.get(&resource_id) {
+                    if let Some(resource_id) = resource_id
+                        && let Some(entry) = engine.state.get(&resource_id) {
                             let rs_arc = entry.clone();
                             let mut guard = rs_arc.try_write().expect("replay: uncontended write");
                             apply_to_resource(&mut guard, other, &engine.entity_to_resource);
                         }
-                    }
                 }
             }
         }
@@ -388,11 +386,10 @@ impl Engine {
         if self.state.len() >= MAX_RESOURCES_PER_TENANT {
             return Err(EngineError::LimitExceeded("too many resources"));
         }
-        if let Some(ref n) = name {
-            if n.len() > MAX_NAME_LEN {
+        if let Some(ref n) = name
+            && n.len() > MAX_NAME_LEN {
                 return Err(EngineError::LimitExceeded("resource name too long"));
             }
-        }
         if let Some(pid) = parent_id {
             // Check hierarchy depth
             let mut depth = 0usize;
@@ -435,20 +432,18 @@ impl Engine {
             return Err(EngineError::NotFound(id));
         }
         // O(1) children check via index
-        if let Some(kids) = self.children.get(&id) {
-            if !kids.is_empty() {
+        if let Some(kids) = self.children.get(&id)
+            && !kids.is_empty() {
                 return Err(EngineError::HasChildren(id));
             }
-        }
 
         // Remove from parent's children list
         let rs = self.get_resource(&id).unwrap();
         let guard = rs.read().await;
-        if let Some(pid) = guard.parent_id {
-            if let Some(mut kids) = self.children.get_mut(&pid) {
+        if let Some(pid) = guard.parent_id
+            && let Some(mut kids) = self.children.get_mut(&pid) {
                 kids.retain(|c| c != &id);
             }
-        }
         drop(guard);
 
         let event = Event::ResourceDeleted { id };
@@ -475,8 +470,8 @@ impl Engine {
         }
 
         // Projection validation: non-blocking rules must be covered by parent availability
-        if !blocking {
-            if let Some(parent_id) = guard.parent_id {
+        if !blocking
+            && let Some(parent_id) = guard.parent_id {
                 let parent_free = self
                     .compute_availability(parent_id, span.start, span.end, None)
                     .await?;
@@ -489,7 +484,6 @@ impl Engine {
                     });
                 }
             }
-        }
 
         let event = Event::RuleAdded {
             id,
@@ -574,11 +568,10 @@ impl Engine {
         label: Option<String>,
     ) -> Result<(), EngineError> {
         validate_span(&span)?;
-        if let Some(ref l) = label {
-            if l.len() > MAX_LABEL_LEN {
+        if let Some(ref l) = label
+            && l.len() > MAX_LABEL_LEN {
                 return Err(EngineError::LimitExceeded("label too long"));
             }
-        }
         let rs = self
             .get_resource(&resource_id)
             .ok_or(EngineError::NotFound(resource_id))?;
@@ -616,11 +609,10 @@ impl Engine {
         }
         for (_, _, span, label) in &bookings {
             validate_span(span)?;
-            if let Some(l) = label {
-                if l.len() > MAX_LABEL_LEN {
+            if let Some(l) = label
+                && l.len() > MAX_LABEL_LEN {
                     return Err(EngineError::LimitExceeded("label too long"));
                 }
-            }
         }
 
         // Collect unique resource IDs and acquire write locks in sorted order
@@ -808,16 +800,14 @@ impl Engine {
 
             if prev < threshold && count >= threshold {
                 seg_start = Some(*time);
-            } else if prev >= threshold && count < threshold {
-                if let Some(start) = seg_start.take() {
-                    if *time > start {
-                        let span = Span::new(start, *time);
-                        if min_duration_ms.map_or(true, |d| span.duration_ms() >= d) {
-                            result.push(span);
-                        }
+            } else if prev >= threshold && count < threshold
+                && let Some(start) = seg_start.take()
+                && *time > start {
+                    let span = Span::new(start, *time);
+                    if min_duration_ms.is_none_or(|d| span.duration_ms() >= d) {
+                        result.push(span);
                     }
                 }
-            }
         }
 
         Ok(result)
@@ -924,11 +914,10 @@ impl Engine {
         capacity: u32,
         buffer_after: Option<Ms>,
     ) -> Result<(), EngineError> {
-        if let Some(ref n) = name {
-            if n.len() > MAX_NAME_LEN {
+        if let Some(ref n) = name
+            && n.len() > MAX_NAME_LEN {
                 return Err(EngineError::LimitExceeded("resource name too long"));
             }
-        }
         let rs = self
             .get_resource(&id)
             .ok_or(EngineError::NotFound(id))?;
@@ -969,11 +958,10 @@ impl Engine {
             let rs = entry.value().clone();
             if let Ok(guard) = rs.try_read() {
                 for interval in &guard.intervals {
-                    if let IntervalKind::Hold { expires_at } = interval.kind {
-                        if expires_at <= now {
+                    if let IntervalKind::Hold { expires_at } = interval.kind
+                        && expires_at <= now {
                             expired.push((interval.id, guard.id));
                         }
-                    }
                 }
             }
         }
@@ -1193,13 +1181,11 @@ pub fn compute_saturated_spans(allocs: &[Span], capacity: u32) -> Vec<Span> {
 
         if count >= capacity && saturated_start.is_none() {
             saturated_start = Some(*time);
-        } else if count < capacity {
-            if let Some(start) = saturated_start.take() {
-                if *time > start {
-                    result.push(Span::new(start, *time));
-                }
+        } else if count < capacity
+            && let Some(start) = saturated_start.take()
+            && *time > start {
+                result.push(Span::new(start, *time));
             }
-        }
     }
 
     result
@@ -1286,12 +1272,11 @@ pub fn availability(
 pub fn merge_overlapping(sorted: &[Span]) -> Vec<Span> {
     let mut merged: Vec<Span> = Vec::new();
     for &span in sorted {
-        if let Some(last) = merged.last_mut() {
-            if span.start <= last.end {
+        if let Some(last) = merged.last_mut()
+            && span.start <= last.end {
                 last.end = last.end.max(span.end);
                 continue;
             }
-        }
         merged.push(span);
     }
     merged

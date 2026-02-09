@@ -27,3 +27,7 @@ metrics-exporter-prometheus = { version = "0.16", features = ["http-listener"] }
 [dev-dependencies]
 tokio-test = "0.4"
 tokio-postgres = "0.7"
+
+[[bench]]
+name = "stress"
+harness = false

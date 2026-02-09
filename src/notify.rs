@@ -12,6 +12,12 @@ pub struct NotifyHub {
     channels: DashMap<Ulid, broadcast::Sender<Event>>,
 }
 
+impl Default for NotifyHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NotifyHub {
     pub fn new() -> Self {
         Self {

@@ -570,12 +570,8 @@ fn count_params(sql: &str) -> usize {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            if i > start {
-                if let Ok(n) = sql[start..i].parse::<usize>() {
-                    if n > max {
-                        max = n;
-                    }
-                }
+            if i > start && let Ok(n) = sql[start..i].parse::<usize>() && n > max {
+                max = n;
             }
         } else {
             i += 1;
@@ -713,17 +709,15 @@ pub async fn process_connection(
                         noop.clone(),
                     )
                     .await
-                    {
-                        if pgwire::tokio::server::process_error(
+                        && pgwire::tokio::server::process_error(
                             &mut socket,
                             e,
                             is_extended,
                         )
                         .await
                         .is_err()
-                        {
-                            break;
-                        }
+                    {
+                        break;
                     }
                 }
                 Action::Message(_) => break,
