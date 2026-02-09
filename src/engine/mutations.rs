@@ -60,6 +60,7 @@ impl Engine {
             self.store.add_child(pid, id);
         }
         self.notify.send(id, &event);
+        self.notify_ancestors(parent_id, &event);
         Ok(())
     }
 
@@ -73,7 +74,8 @@ impl Engine {
 
         let rs = self.get_resource(&id).unwrap();
         let guard = rs.read().await;
-        if let Some(pid) = guard.parent_id {
+        let parent_id = guard.parent_id;
+        if let Some(pid) = parent_id {
             self.store.remove_child(&pid, &id);
         }
         drop(guard);
@@ -82,6 +84,7 @@ impl Engine {
         self.wal_append(&event).await?;
         self.store.remove_resource(&id);
         self.notify.send(id, &event);
+        self.notify_ancestors(parent_id, &event);
         Ok(())
     }
 
@@ -259,8 +262,10 @@ impl Engine {
             let event = Event::BookingConfirmed { id, resource_id, span, label };
             self.wal_append(&event).await?;
             let guard_idx = rs_map[&resource_id];
+            let parent_id = guards[guard_idx].parent_id;
             self.store.apply_event(&mut guards[guard_idx], &event);
             self.notify.send(resource_id, &event);
+            self.notify_ancestors(parent_id, &event);
         }
 
         Ok(())

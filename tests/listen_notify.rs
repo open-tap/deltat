@@ -411,6 +411,381 @@ async fn disconnect_cleans_up() {
 }
 
 #[tokio::test]
+async fn event_bubbles_to_parent() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let parent_id = Ulid::new();
+    let child_id = Ulid::new();
+
+    // Create parent and child
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{parent_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_id}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    // Parent needs availability so the child rule passes validation
+    let parent_rule = Ulid::new();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{parent_rule}', '{parent_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Listen on PARENT only — after setup so we don't catch the parent rule event
+    client1
+        .batch_execute(&format!("LISTEN resource_{parent_id}"))
+        .await
+        .unwrap();
+
+    // Mutate child from another connection
+    let (client2, _) = connect(addr).await;
+    let rule_id = Ulid::new();
+    client2
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{rule_id}', '{child_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Parent should receive notification about child's mutation
+    let notif = recv_notification(&mut rx1, Duration::from_secs(5)).await;
+    assert!(notif.is_some(), "parent should receive child's event via bubbling");
+    let notif = notif.unwrap();
+    assert_eq!(notif.channel(), &format!("resource_{parent_id}"));
+
+    // Payload should reference the child resource
+    let parsed: serde_json::Value = serde_json::from_str(notif.payload()).unwrap();
+    assert!(parsed.is_object());
+}
+
+#[tokio::test]
+async fn event_bubbles_to_root() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let root_id = Ulid::new();
+    let mid_id = Ulid::new();
+    let leaf_id = Ulid::new();
+
+    // Create 3-level hierarchy: root → mid → leaf
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{root_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{mid_id}', '{root_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{leaf_id}', '{mid_id}')"
+        ))
+        .await
+        .unwrap();
+
+    // Each level needs availability so child rules pass validation
+    let root_rule = Ulid::new();
+    let mid_rule = Ulid::new();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{root_rule}', '{root_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{mid_rule}', '{mid_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Listen on ROOT only — after setup so we don't catch parent rule events
+    client1
+        .batch_execute(&format!("LISTEN resource_{root_id}"))
+        .await
+        .unwrap();
+
+    // Mutate leaf from another connection
+    let (client2, _) = connect(addr).await;
+    let rule_id = Ulid::new();
+    client2
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{rule_id}', '{leaf_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Root should receive notification about leaf's mutation (bubbled through mid)
+    let notif = recv_notification(&mut rx1, Duration::from_secs(5)).await;
+    assert!(notif.is_some(), "root should receive leaf's event via bubbling");
+    assert_eq!(notif.unwrap().channel(), &format!("resource_{root_id}"));
+}
+
+#[tokio::test]
+async fn bubbling_does_not_leak_to_siblings() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let parent_id = Ulid::new();
+    let child_a = Ulid::new();
+    let child_b = Ulid::new();
+
+    // Create parent with two children
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{parent_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_a}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_b}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    // Parent needs availability so child rules pass validation
+    let parent_rule = Ulid::new();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{parent_rule}', '{parent_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Listen on child_a only (sibling of child_b)
+    client1
+        .batch_execute(&format!("LISTEN resource_{child_a}"))
+        .await
+        .unwrap();
+
+    // Mutate child_b
+    let (client2, _) = connect(addr).await;
+    let rule_id = Ulid::new();
+    client2
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{rule_id}', '{child_b}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // child_a should NOT receive child_b's event (bubbling goes UP, not sideways)
+    let notif = recv_notification(&mut rx1, Duration::from_millis(500)).await;
+    assert!(notif.is_none(), "sibling should not receive events via bubbling");
+}
+
+#[tokio::test]
+async fn hold_bubbles_to_parent() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let parent_id = Ulid::new();
+    let child_id = Ulid::new();
+
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{parent_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_id}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    // Parent and child need availability rules
+    let parent_rule = Ulid::new();
+    let child_rule = Ulid::new();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{parent_rule}', '{parent_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{child_rule}', '{child_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Listen on parent after setup
+    client1
+        .batch_execute(&format!("LISTEN resource_{parent_id}"))
+        .await
+        .unwrap();
+
+    // Place hold on child
+    let (client2, _) = connect(addr).await;
+    let hold_id = Ulid::new();
+    let expires = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64)
+        + 900_000;
+    client2
+        .batch_execute(&format!(
+            r#"INSERT INTO holds (id, resource_id, start, "end", expires_at) VALUES ('{hold_id}', '{child_id}', 1000, 2000, {expires})"#
+        ))
+        .await
+        .unwrap();
+
+    let notif = recv_notification(&mut rx1, Duration::from_secs(5)).await;
+    assert!(notif.is_some(), "parent should receive child's HoldPlaced via bubbling");
+    assert_eq!(notif.unwrap().channel(), &format!("resource_{parent_id}"));
+}
+
+#[tokio::test]
+async fn booking_bubbles_to_parent() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let parent_id = Ulid::new();
+    let child_id = Ulid::new();
+
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{parent_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_id}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    let parent_rule = Ulid::new();
+    let child_rule = Ulid::new();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{parent_rule}', '{parent_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            r#"INSERT INTO rules (id, resource_id, start, "end", blocking) VALUES ('{child_rule}', '{child_id}', 1000, 2000, false)"#
+        ))
+        .await
+        .unwrap();
+
+    // Listen on parent after setup
+    client1
+        .batch_execute(&format!("LISTEN resource_{parent_id}"))
+        .await
+        .unwrap();
+
+    // Book on child
+    let (client2, _) = connect(addr).await;
+    let booking_id = Ulid::new();
+    client2
+        .batch_execute(&format!(
+            r#"INSERT INTO bookings (id, resource_id, start, "end") VALUES ('{booking_id}', '{child_id}', 1000, 2000)"#
+        ))
+        .await
+        .unwrap();
+
+    let notif = recv_notification(&mut rx1, Duration::from_secs(5)).await;
+    assert!(notif.is_some(), "parent should receive child's BookingConfirmed via bubbling");
+    assert_eq!(notif.unwrap().channel(), &format!("resource_{parent_id}"));
+}
+
+#[tokio::test]
+async fn create_resource_bubbles_to_parent() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let parent_id = Ulid::new();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    // Listen on parent before creating child
+    client1
+        .batch_execute(&format!("LISTEN resource_{parent_id}"))
+        .await
+        .unwrap();
+
+    let (client2, _) = connect(addr).await;
+    let child_id = Ulid::new();
+    client2
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_id}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    let notif = recv_notification(&mut rx1, Duration::from_secs(5)).await;
+    assert!(notif.is_some(), "parent should receive ResourceCreated via bubbling");
+    assert_eq!(notif.unwrap().channel(), &format!("resource_{parent_id}"));
+}
+
+#[tokio::test]
+async fn delete_resource_bubbles_to_parent() {
+    let (addr, _tm) = start_test_server().await;
+    let (client1, mut rx1) = connect(addr).await;
+
+    let parent_id = Ulid::new();
+    let child_id = Ulid::new();
+
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id) VALUES ('{parent_id}')"
+        ))
+        .await
+        .unwrap();
+    client1
+        .batch_execute(&format!(
+            "INSERT INTO resources (id, parent_id) VALUES ('{child_id}', '{parent_id}')"
+        ))
+        .await
+        .unwrap();
+
+    // Listen on parent after setup
+    client1
+        .batch_execute(&format!("LISTEN resource_{parent_id}"))
+        .await
+        .unwrap();
+
+    let (client2, _) = connect(addr).await;
+    client2
+        .batch_execute(&format!("DELETE FROM resources WHERE id = '{child_id}'"))
+        .await
+        .unwrap();
+
+    let notif = recv_notification(&mut rx1, Duration::from_secs(5)).await;
+    assert!(notif.is_some(), "parent should receive ResourceDeleted via bubbling");
+    assert_eq!(notif.unwrap().channel(), &format!("resource_{parent_id}"));
+}
+
+#[tokio::test]
 async fn multiple_events_on_same_channel() {
     let (addr, _tm) = start_test_server().await;
     let (client1, mut rx1) = connect(addr).await;

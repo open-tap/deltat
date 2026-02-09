@@ -212,6 +212,8 @@ impl Engine {
     }
 
     /// WAL-append + apply + notify in one call. Eliminates the repeated 3-line pattern.
+    /// Events bubble up the resource tree: after notifying the direct resource,
+    /// the same event is sent to each ancestor up to the root.
     pub(super) async fn persist_and_apply(
         &self,
         resource_id: Ulid,
@@ -221,7 +223,19 @@ impl Engine {
         self.wal_append(event).await?;
         self.store.apply_event(rs, event);
         self.notify.send(resource_id, event);
+        self.notify_ancestors(rs.parent_id, event);
         Ok(())
+    }
+
+    /// Walk up the parent chain, sending the event to each ancestor's channel.
+    fn notify_ancestors(&self, parent_id: Option<Ulid>, event: &Event) {
+        let mut current = parent_id;
+        while let Some(pid) = current {
+            self.notify.send(pid, event);
+            current = self.store.get_resource(&pid).and_then(|rs| {
+                rs.try_read().ok().and_then(|guard| guard.parent_id)
+            });
+        }
     }
 
     /// Lookup entity → resource, get resource, acquire write lock.
