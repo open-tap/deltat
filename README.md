@@ -9,7 +9,7 @@
 
 In a video game, a collision engine answers one question: do these two objects overlap?
 
-Scheduling is the same problem in one dimension. A booking is a segment on the number line of time. Two bookings conflict when their segments collide. That's the entire model.
+Scheduling is the same problem in one dimension. A booking is a segment range on the number line of unix time. Two bookings conflict when their segments collide. That's the entire model.
 
 ```
  ──────[  Flight  ]───────────────────────────────────────
